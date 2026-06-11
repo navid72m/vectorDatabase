@@ -18,9 +18,7 @@ builds via seeded xorshift RNG.
 
 ## Build & run
 
-```sh
-make
-```
+
 
 ## Usage
 
@@ -74,16 +72,12 @@ vecdb_save(db, "index.vecdb");
 
 ## Build & run
 
-```sh
-make
-```
+
 
 ## API
 
 
-```sh
-make
-```
+
 
 ## API
 
