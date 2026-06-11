@@ -1,0 +1,25 @@
+[project]
+name = "vecdb"
+version = "0.1.0"
+description = "A lightweight vector database in C with Python bindings."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{name = "Seyed Navid Mirnour algeri", email = "navid72m@gmail.com"}]
+license = {text = "MIT"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = ""}
+packages = ["."]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"" = ["libvecdb.so"]
