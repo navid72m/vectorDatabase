@@ -23,6 +23,71 @@ make
 ./bench 50000 128     # N, dim
 ```
 
+## Usage
+
+### Python bindings
+
+```python
+from pyvecdb import VecDB
+
+# Create a new DB (dimensionality must match your vectors)
+
+db = VecDB(dim=128, M=16, ef_construction=200)
+
+# Add vectors (numpy array of shape (n, dim), dtype float32)
+# You can also add a list of vectors or a (ids, vectors) tuple.
+ids = db.add(vectors)  # returns list of assigned IDs
+
+# Search for nearest neighbours
+query = np.random.rand(1, 128).astype(np.float32)
+ids, distances = db.search(query, k=10, ef=100)
+print("Nearest IDs:", ids)
+print("Distances:", distances)
+
+# Save / load the index
+
+db.save("index.vecdb")
+
+# Load later
+loaded = VecDB.load("index.vecdb")
+```
+
+### C API (advanced)
+
+The underlying C library `libvecdb.so` provides the same functionality for
+embedding‑heavy workloads. See `vecdb.h` for the full interface.
+
+```c
+VecDBConfig cfg = vecdb_default_config(128);
+VecDB *db = vecdb_create(&cfg);
+
+// Add a single vector (id must be unique)
+float vec[128]; // fill with your data
+vecdb_add(db, 42, vec);
+
+// Search
+VecResult results[10];
+vecdb_search_hnsw(db, query_vec, 10, 100, results);
+
+// Persist
+vecdb_save(db, "index.vecdb");
+```
+
+## Build & run
+
+```sh
+make
+./bench 50000 128     # N, dim
+```
+
+## API
+
+
+```sh
+make
+./bench 50000 128     # N, dim
+```
+
 ## API
 
 ```c
