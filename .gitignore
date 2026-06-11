@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# C extensions
+*.so
+*.dylib
+
+# Build artefacts
+*.o
+*.obj
+*.a
+*.lib
+
+# VSCode
+.vscode/
+
+# macOS metadata
+.DS_Store
+
+# Logs
+*.log
