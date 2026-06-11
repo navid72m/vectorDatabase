@@ -20,7 +20,6 @@ builds via seeded xorshift RNG.
 
 ```sh
 make
-./bench 50000 128     # N, dim
 ```
 
 ## Usage
@@ -77,7 +76,6 @@ vecdb_save(db, "index.vecdb");
 
 ```sh
 make
-./bench 50000 128     # N, dim
 ```
 
 ## API
@@ -85,7 +83,6 @@ make
 
 ```sh
 make
-./bench 50000 128     # N, dim
 ```
 
 ## API
