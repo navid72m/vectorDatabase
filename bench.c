@@ -31,9 +31,9 @@ int main(int argc, char **argv) {
     }
     VecResult out[10];
     vecdb_search_hnsw(db, q, 10, 100, out);
-    printf("Top result id: %d distance: %f\n", out[0].id, out[0].distance);
+    printf("Top result id: %llu distance: %f\n", out[0].id, out[0].dist);
     free(q);
     vecdb_save(db, "index.vecdb");
-    vecdb_destroy(db);
+    vecdb_free(db);
     return 0;
 }
