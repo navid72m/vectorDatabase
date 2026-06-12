@@ -367,9 +367,29 @@ against exact ground truth (see `benchmarks/` for the scripts):
 Churn stability: 5 cycles of 30% delete+reinsert on 10k vectors held
 recall@10 at 0.95-0.97; `compact()` rebuilt 10k vectors in ~1.6s.
 
-Caveats: one machine (AVX-512 + VNNI), synthetic clustered data, single
-thread; the Qdrant comparison in `benchmarks/benchmark.py` uses
-qdrant-client's in-process mode, not a server.
+### 1M vectors on Apple Silicon (M2 Pro, NEON build, single thread)
+
+1,000,000 x 128 Gaussian-mixture vectors, 200 held-out queries, recall
+against exact ground truth (`benchmarks/bench_large.py --n 1000000`):
+
+| ef  | QPS    | recall@10 |
+|-----|--------|-----------|
+| 10  | 30,666 | 0.618     |
+| 50  | 10,691 | 0.926     |
+| 100 |  7,471 | 0.978     |
+| 200 |  5,427 | 0.989     |
+| 400 |  3,836 | 0.999     |
+
+Build: 178s (5,622 vec/s) with capacity preallocated. On *uniform* random
+128-d data the same index scores ~0.42 recall@10 at ef=200 — uniform
+high-dimensional data breaks HNSW's navigability assumptions at scale;
+that is a property of the data, not the implementation, and is why
+`bench_large.py` offers both geometries.
+
+Caveats: x86 numbers from one AVX-512 + VNNI machine, ARM numbers from one
+M2 Pro; synthetic clustered data, single thread; the Qdrant comparison in
+`benchmarks/benchmark.py` uses qdrant-client's in-process mode, not a
+server.
 
 ## License
 
