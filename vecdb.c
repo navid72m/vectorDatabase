@@ -347,20 +347,29 @@ void vecdb_free(VecDB *db)
 size_t vecdb_count(const VecDB *db) { return db->alive; }
 int    vecdb_dim(const VecDB *db)   { return db->dim; }
 
-static void grow(VecDB *db)
+/* Doubles capacity. Returns 0 on success, -1 on allocation failure
+ * (in which case the db is left valid at its old capacity). */
+static int grow(VecDB *db)
 {
     size_t ncap = db->cap * 2;
-    db->vecs    = realloc(db->vecs,   ncap * (size_t)db->dim * sizeof(float));
-    db->vnorms  = realloc(db->vnorms, ncap * sizeof(float));
-    db->ids     = realloc(db->ids,    ncap * sizeof(uint64_t));
-    db->l0      = realloc(db->l0,     ncap * db->l0_stride * sizeof(uint32_t));
-    db->upper   = realloc(db->upper,  ncap * sizeof(uint32_t *));
-    db->node_level = realloc(db->node_level, ncap);
-    db->dead    = realloc(db->dead, ncap);
+#define GROW(field, type, elts) do { \
+        void *p_ = realloc(db->field, (elts) * sizeof(type)); \
+        if (!p_) return -1; \
+        db->field = p_; \
+    } while (0)
+    GROW(vecs,       float,      ncap * (size_t)db->dim);
+    GROW(vnorms,     float,      ncap);
+    GROW(ids,        uint64_t,   ncap);
+    GROW(l0,         uint32_t,   ncap * db->l0_stride);
+    GROW(upper,      uint32_t *, ncap);
+    GROW(node_level, uint8_t,    ncap);
+    GROW(dead,       uint8_t,    ncap);
+#undef GROW
     memset(db->upper + db->cap, 0, (ncap - db->cap) * sizeof(uint32_t *));
     memset(db->node_level + db->cap, 0, ncap - db->cap);
     memset(db->dead + db->cap, 0, ncap - db->cap);
     db->cap = ncap;
+    return 0;
 }
 
 static int link_cap(const VecDB *db, int level) { return level == 0 ? db->M0 : db->M; }
@@ -483,23 +492,24 @@ static void shrink_links(VecDB *db, uint32_t node, int level)
 
 int64_t vecdb_add(VecDB *db, uint64_t id, const float *vec)
 {
-    if (!db || !vec) return -1;
+    if (!db) return -1;
     if (db->count == db->cap) grow(db);
-
-    if (map_get(db, id) != UINT32_MAX) return -1;   /* duplicate live id */
-
+    if (map_get(db, id) != UINT32_MAX) return -1; /* duplicate */
     uint32_t idx = (uint32_t)db->count++;
     db->dead[idx] = 0;
     db->alive++;
     map_put(db, id, idx);
-    memcpy(db->vecs + (size_t)idx * db->dim, vec, (size_t)db->dim * sizeof(float));
+    memcpy(db->vecs + (size_t)idx * db->dim, vec,
+           (size_t)db->dim * sizeof(float));
     db->ids[idx] = id;
-    {
-        double nsq = 0.0;
-        for (int i = 0; i < db->dim; i++) nsq += (double)vec[i] * vec[i];
-        db->vnorms[idx] = (float)nsq;
+    // pre‑compute norm for flat‑exact
+    double nsq = 0.0;
+    for (int i = 0; i < db->dim; i++) {
+        double x = vec[i];
+        nsq += x * x;
     }
-
+    db->vnorms[idx] = (float)nsq;
+    // insert into HNSW graph
     int level = sample_level(db);
     db->node_level[idx] = (uint8_t)level;
     node_links(db, idx, 0)[0] = 0;
@@ -508,55 +518,62 @@ int64_t vecdb_add(VecDB *db, uint64_t id, const float *vec)
     } else {
         db->upper[idx] = NULL;
     }
-
     if (db->entry < 0) {                 /* first element */
         db->entry = idx;
         db->max_level = level;
         return idx;
     }
-
     uint32_t ep = (uint32_t)db->entry;
-
     /* descend from the top to level+1 greedily */
     for (int l = db->max_level; l > level; l--)
         ep = greedy_step(db, vec, ep, l);
-
     /* insert on each layer from min(level, max_level) down to 0 */
     int start = level < db->max_level ? level : db->max_level;
     for (int l = start; l >= 0; l--) {
         Heap res; heap_init(&res, db->ef_construction + 1, 1);
         search_layer(db, vec, ep, db->ef_construction, l, &res, 0, NULL);
-
         int M = db->M;  /* links to create from the new node */
         uint32_t *sel = malloc((size_t)M * sizeof(uint32_t));
         int kept = select_neighbors(db, vec, res.a, res.n, M, sel);
-
         /* connect new -> selected */
         uint32_t *L = node_links(db, idx, l);
         for (int j = 0; j < kept; j++) L[1 + L[0]++] = sel[j];
-
         /* connect selected -> new, pruning overfull lists */
         for (int j = 0; j < kept; j++) {
             uint32_t *NL = node_links(db, sel[j], l);
             NL[1 + NL[0]++] = idx;
             if ((int)NL[0] > link_cap(db, l)) shrink_links(db, sel[j], l);
         }
-
         /* best candidate becomes entry for the next (lower) layer */
         float bd = 1e30f; uint32_t bn = ep;
         for (int j = 0; j < res.n; j++)
             if (res.a[j].dist < bd) { bd = res.a[j].dist; bn = res.a[j].node; }
         ep = bn;
-
         free(sel);
         heap_destroy(&res);
     }
-
     if (level > db->max_level) {
         db->max_level = level;
         db->entry = idx;
     }
     return idx;
+}
+
+/* ------------------------------------------------------------------ */
+/* Bulk‑insert – loops in C, no Python per‑vector overhead.            */
+/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* Bulk insert: one C call for a whole batch (removes the Python-level
+ * loop). Delegates to vecdb_add per element so there is exactly one
+ * insert code path. Returns 0 on success; on the first failure
+ * (duplicate id or OOM) returns -1 with prior elements inserted. */
+int vecdb_add_bulk(VecDB *db, const uint64_t *ids, const float *vecs, size_t n)
+{
+    if (!db || (!ids && n) || (!vecs && n)) return -1;
+    for (size_t i = 0; i < n; i++)
+        if (vecdb_add(db, ids[i], vecs + i * (size_t)db->dim) < 0)
+            return -1;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */

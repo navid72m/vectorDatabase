@@ -34,6 +34,15 @@ void   vecdb_free(VecDB *db);
 
 /* Insert one vector. Returns internal index (>=0) or -1 on error. */
 int64_t vecdb_add(VecDB *db, uint64_t id, const float *vec);
+/* Bulk‑insert a whole batch of vectors in a single C call.
+ * The function copies the data, updates the ID map and wires the HNSW
+ * graph exactly as vecdb_add() does, but without the Python‑level loop.
+ * Returns 0 on success, -1 on allocation error or duplicate ID.
+ */
+int vecdb_add_bulk(VecDB *db,
+                    const uint64_t *ids,
+                    const float *vecs,
+                    size_t n);
 
 /* Delete a vector by its user-supplied id (O(1), tombstone). The node keeps
  * carrying graph connectivity but is excluded from all results.

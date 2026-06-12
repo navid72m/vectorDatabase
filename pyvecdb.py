@@ -69,6 +69,9 @@ _lib.vecdb_save.restype = c_int
 _lib.vecdb_load.argtypes = [c_char_p]
 _lib.vecdb_load.restype = c_void_p
 
+_lib.vecdb_add_bulk.argtypes = [c_void_p, POINTER(c_uint64), POINTER(c_float), c_size_t]
+_lib.vecdb_add_bulk.restype = c_int
+
 # Delete support
 _lib.vecdb_delete.argtypes = [c_void_p, c_uint64]
 _lib.vecdb_delete.restype = c_int
@@ -113,7 +116,7 @@ class VecDB:
 
     # -- writes --------------------------------------------------------
     def add(self, vectors: np.ndarray, ids: np.ndarray | None = None) -> None:
-        """Add a (n, dim) float32 batch. ids default to current_count..+n."""
+        """Add a (n, dim) float32 batch (slow Python loop)."""
         vectors = _as_f32_matrix(vectors, self.dim)
         n = vectors.shape[0]
         if ids is None:
@@ -123,13 +126,28 @@ class VecDB:
             ids = np.ascontiguousarray(ids, dtype=np.uint64)
             if ids.shape != (n,):
                 raise ValueError("ids must have shape (n,)")
-        fp = vectors.ctypes.data_as(POINTER(c_float))
-        for i in range(n):
-            rc = _lib.vecdb_add(self._h, int(ids[i]),
-                                ctypes.cast(ctypes.addressof(fp.contents)
-                                            + i * self.dim * 4, POINTER(c_float)))
-            if rc < 0:
-                raise RuntimeError(f"vecdb_add failed at row {i}")
+        # fallback to bulk C call – much faster for large n
+        self.add_bulk(ids, vectors)
+
+    def add_bulk(self, ids: np.ndarray, vectors: np.ndarray) -> None:
+        """High‑performance bulk insert.
+
+        *ids*: 1‑D ``np.uint64`` array of length *N*.
+        *vectors*: 2‑D ``np.float32`` array of shape *(N, dim)*.
+        Raises ``RuntimeError`` if the underlying C call returns non‑zero.
+        """
+        ids = np.ascontiguousarray(ids)
+        if ids.ndim != 1 or ids.dtype != np.uint64:
+            raise ValueError("ids must be a 1-D np.uint64 array")
+        if vectors.ndim != 2 or vectors.shape[0] != ids.shape[0] or vectors.shape[1] != self.dim:
+            raise ValueError(f"vectors must be shape (N, {self.dim}) and dtype float32")
+        vectors = np.ascontiguousarray(vectors, dtype=np.float32)
+        rc = _lib.vecdb_add_bulk(self._h,
+                                 ids.ctypes.data_as(POINTER(c_uint64)),
+                                 vectors.ctypes.data_as(POINTER(c_float)),
+                                 ctypes.c_size_t(ids.shape[0]))
+        if rc != 0:
+            raise RuntimeError("vecdb_add_bulk failed (duplicate ID or OOM)")
 
     def delete(self, ids: np.ndarray) -> None:
         """Delete vectors by their IDs.

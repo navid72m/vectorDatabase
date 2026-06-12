@@ -117,6 +117,17 @@ small.delete(np.arange(5, dtype=np.uint64))
 i, d = small.search(rng.standard_normal((1, 8)).astype(np.float32), k=3)
 check("delete-all returns 0 results", np.isinf(d).all())
 
+# ---------------------------------------------------------------- bulk insert
+print("bulk insert:")
+Xb = rng.standard_normal((3000, 32)).astype(np.float32)   # 3x past initial capacity
+dbb = VecDB(dim=32)
+dbb.add_bulk(np.arange(3000, dtype=np.uint64), Xb)
+check("bulk insert past capacity growth", len(dbb) == 3000, str(len(dbb)))
+eb, _ = dbb.search(Xb[:10], k=1, exact=True)
+check("bulk-inserted vectors retrievable", (eb[:,0] == np.arange(10)).all())
+check("bulk duplicate id rejected",
+      _raises(lambda: dbb.add_bulk(np.array([0], dtype=np.uint64), Xb[:1])))
+
 # ---------------------------------------------------------------- turboquant
 print("turboquant:")
 Xt = rng.standard_normal((2000, 128)).astype(np.float32)
