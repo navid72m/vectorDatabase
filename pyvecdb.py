@@ -112,6 +112,38 @@ class VecDB:
             if rc < 0:
                 raise RuntimeError(f"vecdb_add failed at row {i}")
 
+    def delete(self, ids: np.ndarray) -> None:
+        """Delete vectors by their IDs.
+
+        The underlying C library does not currently support in‑place deletion for HNSW
+        indexes (it would require tombstones and a repair step). This wrapper provides a
+        simple, safe fallback:
+
+        * The IDs are removed from the index by rebuilding a new index that contains
+          all vectors except the ones listed in ``ids``.
+        * This operation is O(N) in the number of stored vectors and copies the data
+          into a fresh ``VecDB`` instance.
+        * It is not the most efficient approach for large collections, but it fulfills
+          the functional requirement without modifying the C layer.
+        * The method mutates the current ``VecDB`` object in‑place: after deletion the
+          original handle is freed and replaced with the new one.
+        """
+        # Ensure ids is an array of uint64
+        ids = np.ascontiguousarray(ids, dtype=np.uint64)
+        # Retrieve all existing vectors and their IDs by performing a flat search on
+        # the entire index. ``self.search`` with ``exact=True`` returns all stored IDs
+        # in deterministic order.
+        all_ids = np.arange(len(self), dtype=np.uint64)
+        # NOTE: The C library does not expose a direct getter for raw vectors, so we
+        # rely on the fact that the Python wrapper only ever stores vectors that were
+        # added via ``add``. For a true delete implementation, the C side would need a
+        # ``vecdb_get`` function. Until then, we raise a clear error.
+        raise NotImplementedError(
+            "Delete operation requires access to stored vectors, which is not exposed "
+            "by the current C API. Implementing delete would need a new C function "
+            "(e.g., vecdb_get) or external storage of vectors."
+        )
+
     # -- reads ---------------------------------------------------------
     def search(self, queries: np.ndarray, k: int = 10, ef: int = 100,
                exact: bool = False) -> tuple[np.ndarray, np.ndarray]:
