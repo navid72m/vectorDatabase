@@ -1,27 +1,37 @@
-CC = clang
-CFLAGS = -O3 -march=native -fPIC -Wall -Wextra
+CC      ?= cc
+SRC      = vecdb.c turboquant.c
+OBJ      = $(SRC:.c=.o)
 
-# Conditionally set LDFLAGS based on OS
+# Per-platform tuning: -march=native is rejected by clang on Apple Silicon;
+# the AArch64 equivalent is -mcpu=native.
 UNAME_S := $(shell uname -s)
-ifeq ($(UNAME_S),Darwin)
-    LDFLAGS = -shared -Wl,-install_name,libvecdb.so
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_S)-$(UNAME_M),Darwin-arm64)
+    ARCHFLAGS = -mcpu=native
+    LDSHARED  = -shared -Wl,-install_name,@rpath/libvecdb.so
 else
-    LDFLAGS = -shared
+    ARCHFLAGS = -march=native
+    LDSHARED  = -shared
 endif
 
-SRC = vecdb.c turboquant.c
-OBJ = $(SRC:.c=.o)
+CFLAGS  ?= -O3 $(ARCHFLAGS) -fPIC -Wall -Wextra
 
 all: libvecdb.so
 
 libvecdb.so: $(OBJ)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDSHARED) -o $@ $^ -lm
 
-%.o: %.c
+%.o: %.c vecdb.h turboquant.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-bench: bench.c libvecdb.so
-	$(CC) $(CFLAGS) -o $@ $< -L. -lvecdb -lm
+# bench is compiled statically from sources: no rpath/LD_LIBRARY_PATH needed
+bench: $(SRC) bench.c vecdb.h turboquant.h
+	$(CC) $(CFLAGS) -o $@ $(SRC) bench.c -lm
+
+test: libvecdb.so
+	python3 tests.py
 
 clean:
 	rm -f $(OBJ) libvecdb.so bench
+
+.PHONY: all test clean
