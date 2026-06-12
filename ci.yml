@@ -1,0 +1,19 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install numpy
+        run: pip install numpy
+      - name: Build library and bench
+        run: |
+          make
+          make bench
+      - name: Run test suite
+        run: python3 tests.py
