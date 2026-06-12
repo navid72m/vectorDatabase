@@ -84,6 +84,12 @@ struct TQIndex {
     float    *norms;  /* count                                 */
     float    *csqs;   /* count: sum of levels[c_i]^2 (unit scale) */
 
+    /* bits==8 stores re-quantized int8 values (Lloyd-Max reconstruction
+     * snapped to a signed-127 grid) so the scan can use AVX512-VNNI.    */
+    float     lmax;   /* max |level|                           */
+    float     s8x;    /* 127 / lmax: float -> int8 scale       */
+    int32_t  *i8sums; /* count: sum of stored int8 (VNNI bias) */
+
     /* QJL residual stage (TurboQuant-prod, Alg. 2 of the paper)   */
     int       qjl;        /* 0 = MSE variant only                  */
     float    *S;          /* pdim x pdim iid N(0,1) projection     */
@@ -118,6 +124,12 @@ TQIndex *tq_create2(int dim, int bits, int use_qjl, uint64_t seed)
     tq->levels = malloc(tq->K * sizeof(float));
     tq->bounds = malloc((tq->K - 1) * sizeof(float));
     lloyd_max_gaussian(tq->K, tq->levels, tq->bounds);
+    tq->lmax = 0.f;
+    for (int k = 0; k < tq->K; k++) {
+        float a = fabsf(tq->levels[k]);
+        if (a > tq->lmax) tq->lmax = a;
+    }
+    tq->s8x = 127.0f / tq->lmax;
 
     uint64_t s = seed ? seed : 0x9E3779B97F4A7C15ULL;
     tq->signs = malloc((size_t)TQ_ROUNDS * tq->pdim * sizeof(float));
@@ -136,6 +148,7 @@ TQIndex *tq_create2(int dim, int bits, int use_qjl, uint64_t seed)
 
     tq->cap = 1024;
     tq->codes = malloc(tq->cap * tq->code_bytes);
+    tq->i8sums = bits == 8 ? malloc(tq->cap * sizeof(int32_t)) : NULL;
     tq->norms = malloc(tq->cap * sizeof(float));
     tq->csqs  = malloc(tq->cap * sizeof(float));
     tq->ids   = malloc(tq->cap * sizeof(uint64_t));
@@ -156,7 +169,7 @@ void tq_free(TQIndex *tq)
 {
     if (!tq) return;
     free(tq->levels); free(tq->bounds); free(tq->signs);
-    free(tq->codes); free(tq->norms); free(tq->csqs); free(tq->ids); free(tq->scratch);
+    free(tq->codes); free(tq->i8sums); free(tq->norms); free(tq->csqs); free(tq->ids); free(tq->scratch);
     free(tq->S); free(tq->qjl_bits); free(tq->rnorms); free(tq->scratch2);
     free(tq);
 }
@@ -166,6 +179,7 @@ size_t tq_count(const TQIndex *tq) { return tq->count; }
 size_t tq_memory_bytes(const TQIndex *tq)
 {
     size_t per = tq->code_bytes + 2 * sizeof(float) + sizeof(uint64_t);
+    if (tq->bits == 8) per += sizeof(int32_t);          /* VNNI bias sum */
     if (tq->qjl) per += tq->qjl_bytes + sizeof(float);
     return tq->count * per;
 }
@@ -193,12 +207,15 @@ static inline int quantize_coord(const TQIndex *tq, float v)
     return lo;
 }
 
+static float tq_dotf(const float *a, const float *b, int n);
+
 int64_t tq_add(TQIndex *tq, uint64_t id, const float *vec)
 {
     if (!tq || !vec) return -1;
     if (tq->count == tq->cap) {
         tq->cap *= 2;
         tq->codes = realloc(tq->codes, tq->cap * tq->code_bytes);
+        if (tq->i8sums) tq->i8sums = realloc(tq->i8sums, tq->cap * sizeof(int32_t));
         tq->norms = realloc(tq->norms, tq->cap * sizeof(float));
         tq->csqs  = realloc(tq->csqs,  tq->cap * sizeof(float));
         tq->ids   = realloc(tq->ids,   tq->cap * sizeof(uint64_t));
@@ -229,12 +246,26 @@ int64_t tq_add(TQIndex *tq, uint64_t id, const float *vec)
     uint8_t *code = tq->codes + tq->count * tq->code_bytes;
     memset(code, 0, tq->code_bytes);
     double csq = 0.0;
+    int32_t i8sum = 0;
     for (int i = 0; i < tq->pdim; i++) {
         int c = quantize_coord(tq, x[i] * sd);
-        if (tq->bits == 8) code[i] = (uint8_t)c;
-        else               code[i >> 1] |= (uint8_t)(c << ((i & 1) ? 4 : 0));
-        csq += (double)tq->levels[c] * tq->levels[c];
+        if (tq->bits == 8) {
+            /* snap the Lloyd-Max reconstruction to the int8 grid; csq and
+             * the QJL residual use the SAME stored value, so the distance
+             * decomposition stays exact w.r.t. what the scan computes.   */
+            int q8 = (int)lrintf(tq->levels[c] * tq->s8x);
+            if (q8 >  127) q8 =  127;
+            if (q8 < -127) q8 = -127;
+            ((int8_t *)code)[i] = (int8_t)q8;
+            float v = (float)q8 / tq->s8x;
+            csq += (double)v * v;
+            i8sum += q8;
+        } else {
+            code[i >> 1] |= (uint8_t)(c << ((i & 1) ? 4 : 0));
+            csq += (double)tq->levels[c] * tq->levels[c];
+        }
     }
+    if (tq->bits == 8) tq->i8sums[tq->count] = i8sum;
     tq->norms[tq->count] = norm;
     tq->csqs[tq->count] = (float)csq;
 
@@ -245,10 +276,10 @@ int64_t tq_add(TQIndex *tq, uint64_t id, const float *vec)
         float *r = tq->scratch2;
         double rn = 0.0;
         for (int i = 0; i < tq->pdim; i++) {
-            int c;
-            if (tq->bits == 8) c = code[i];
-            else c = (code[i >> 1] >> ((i & 1) ? 4 : 0)) & 0x0F;
-            r[i] = x[i] - tq->levels[c] * inv_sdf;
+            float recon;
+            if (tq->bits == 8) recon = (float)((int8_t *)code)[i] / tq->s8x;
+            else recon = tq->levels[(code[i >> 1] >> ((i & 1) ? 4 : 0)) & 0x0F];
+            r[i] = x[i] - recon * inv_sdf;
             rn += (double)r[i] * r[i];
         }
         tq->rnorms[tq->count] = (float)sqrt(rn);
@@ -256,9 +287,7 @@ int64_t tq_add(TQIndex *tq, uint64_t id, const float *vec)
         uint8_t *bits_out = tq->qjl_bits + tq->count * tq->qjl_bytes;
         memset(bits_out, 0, tq->qjl_bytes);
         for (int i = 0; i < tq->pdim; i++) {        /* sign(S * r) */
-            const float *Si = tq->S + (size_t)i * tq->pdim;
-            float dotp = 0.f;
-            for (int j = 0; j < tq->pdim; j++) dotp += Si[j] * r[j];
+            float dotp = tq_dotf(tq->S + (size_t)i * tq->pdim, r, tq->pdim);
             if (dotp >= 0.f) bits_out[i >> 3] |= (uint8_t)(1u << (i & 7));
         }
     }
@@ -274,7 +303,7 @@ int64_t tq_add(TQIndex *tq, uint64_t id, const float *vec)
 /* The scan reduces to a dot product between the rotated query and     */
 /* decoded codes — SIMD: 4-bit decodes via a register-resident LUT     */
 /* (_mm512_permutexvar_ps, the whole codebook lives in one zmm),       */
-/* 8-bit via 32-bit gathers from the 256-entry codebook.               */
+/* 8-bit stores re-quantized int8 and scans with AVX512-VNNI dpbusd.   */
 /* ------------------------------------------------------------------ */
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 #include <immintrin.h>
@@ -295,27 +324,63 @@ static float tq_dot4_avx512(const float *qr, const uint8_t *code, int pdim,
     }
     return _mm512_reduce_add_ps(acc);
 }
+#define TQ_HAVE_SIMD 1
+#endif
 
-static float tq_dot8_avx512(const float *qr, const uint8_t *code, int pdim,
-                            const float *levels)
+#if defined(__AVX512VNNI__)
+/* int8 dot via vpdpbusd: 64 MACs/instruction. Query is offset to unsigned
+ * (qu8 = qi8 + 128); caller corrects with  - 128 * sum(x_i8).             */
+static int32_t tq_doti8_vnni(const uint8_t *qu8, const int8_t *x, int pdim)
+{
+    __m512i acc = _mm512_setzero_si512();
+    for (int i = 0; i < pdim; i += 64)
+        acc = _mm512_dpbusd_epi32(acc,
+                _mm512_loadu_si512((const void *)(qu8 + i)),
+                _mm512_loadu_si512((const void *)(x + i)));
+    return _mm512_reduce_add_epi32(acc);
+}
+#define TQ_HAVE_VNNI 1
+#endif
+
+static int32_t tq_doti8_scalar(const uint8_t *qu8, const int8_t *x, int pdim)
+{
+    int32_t s = 0;
+    for (int i = 0; i < pdim; i++) s += (int32_t)qu8[i] * (int32_t)x[i];
+    return s;
+}
+
+/* plain float dot with AVX-512 + masked tail (QJL matvecs) */
+#ifdef TQ_HAVE_SIMD
+static float tq_dotf(const float *a, const float *b, int n)
 {
     __m512 acc = _mm512_setzero_ps();
-    for (int i = 0; i < pdim; i += 16) {
-        __m512i idx = _mm512_cvtepu8_epi32(
-            _mm_loadu_si128((const __m128i *)(code + i)));
-        __m512 vals = _mm512_i32gather_ps(idx, levels, 4);
-        acc = _mm512_fmadd_ps(_mm512_loadu_ps(qr + i), vals, acc);
+    int i = 0;
+    for (; i + 16 <= n; i += 16)
+        acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc);
+    float s = _mm512_reduce_add_ps(acc);
+    if (i < n) {
+        __mmask16 m = (__mmask16)((1u << (n - i)) - 1u);
+        s += _mm512_reduce_add_ps(_mm512_mul_ps(_mm512_maskz_loadu_ps(m, a + i),
+                                                _mm512_maskz_loadu_ps(m, b + i)));
     }
-    return _mm512_reduce_add_ps(acc);
+    return s;
 }
-#define TQ_HAVE_SIMD 1
+#else
+static float tq_dotf(const float *a, const float *b, int n)
+{
+    float s = 0.f;
+    for (int i = 0; i < n; i++) s += a[i] * b[i];
+    return s;
+}
 #endif
 
 static float tq_dot_scalar(const TQIndex *tq, const float *qr, const uint8_t *code)
 {
     float dot = 0.f;
     if (tq->bits == 8) {
-        for (int i = 0; i < tq->pdim; i++) dot += qr[i] * tq->levels[code[i]];
+        const int8_t *x = (const int8_t *)code;
+        for (int i = 0; i < tq->pdim; i++) dot += qr[i] * (float)x[i];
+        dot /= tq->s8x;
     } else {
         for (int i = 0; i < tq->pdim; i += 2) {
             uint8_t b = code[i >> 1];
@@ -369,18 +434,41 @@ int tq_search(const TQIndex *tq_c, const float *query, int k, VecResult *out)
     float qjl_const = 0.f;
     if (tq->qjl) {
         Sq = malloc(tq->pdim * sizeof(float));
-        for (int i = 0; i < tq->pdim; i++) {
-            const float *Si = tq->S + (size_t)i * tq->pdim;
-            float dotp = 0.f;
-            for (int j = 0; j < tq->pdim; j++) dotp += Si[j] * qr[j];
-            Sq[i] = dotp;
-        }
+        for (int i = 0; i < tq->pdim; i++)
+            Sq[i] = tq_dotf(tq->S + (size_t)i * tq->pdim, qr, tq->pdim);
         qjl_const = sqrtf((float)M_PI / 2.0f) / (float)tq->pdim;
     }
 
 #ifdef TQ_HAVE_SIMD
     const int simd = (tq->pdim % 16) == 0;
 #endif
+
+    /* int8 query prep for the bits==8 VNNI scan: quantize qr once,
+     * offset to unsigned for vpdpbusd, undo scales after the int dot. */
+    uint8_t *qu8 = NULL;
+    float i8_inv_scale = 0.f;     /* 1 / (s8q * s8x) */
+    int32_t q_zero_bias = 0;      /* 128 multiplies sum(x_i8) per vector */
+    int use_i8 = 0;
+    if (tq->bits == 8) {
+        float qmax = 0.f;
+        for (int i = 0; i < tq->pdim; i++) {
+            float a = fabsf(qr[i]);
+            if (a > qmax) qmax = a;
+        }
+        if (qmax > 0.f) {
+            float s8q = 127.0f / qmax;
+            qu8 = malloc(tq->pdim);
+            for (int i = 0; i < tq->pdim; i++) {
+                int q = (int)lrintf(qr[i] * s8q);
+                if (q >  127) q =  127;
+                if (q < -127) q = -127;
+                qu8[i] = (uint8_t)(q + 128);
+            }
+            i8_inv_scale = 1.0f / (s8q * tq->s8x);
+            q_zero_bias = 128;
+            use_i8 = 1;
+        }
+    }
 
     /* simple bounded max-heap over (dist, idx) */
     float    *hd = malloc((size_t)k * sizeof(float));
@@ -391,13 +479,21 @@ int tq_search(const TQIndex *tq_c, const float *query, int k, VecResult *out)
     for (size_t v = 0; v < tq->count; v++) {
         const uint8_t *code = tq->codes + v * tq->code_bytes;
         float dot;
-#ifdef TQ_HAVE_SIMD
-        if (simd)
-            dot = (tq->bits == 4)
-                ? tq_dot4_avx512(qr, code, tq->pdim, tq->levels)
-                : tq_dot8_avx512(qr, code, tq->pdim, tq->levels);
-        else
+        if (use_i8) {
+            int32_t di;
+#ifdef TQ_HAVE_VNNI
+            if ((tq->pdim % 64) == 0)
+                di = tq_doti8_vnni(qu8, (const int8_t *)code, tq->pdim);
+            else
 #endif
+                di = tq_doti8_scalar(qu8, (const int8_t *)code, tq->pdim);
+            dot = (float)(di - q_zero_bias * tq->i8sums[v]) * i8_inv_scale;
+        }
+#ifdef TQ_HAVE_SIMD
+        else if (simd && tq->bits == 4)
+            dot = tq_dot4_avx512(qr, code, tq->pdim, tq->levels);
+#endif
+        else
             dot = tq_dot_scalar(tq, qr, code);
 
         float s = tq->norms[v] * inv_sd;
@@ -460,6 +556,6 @@ int tq_search(const TQIndex *tq_c, const float *query, int k, VecResult *out)
             j = m;
         }
     }
-    free(qr); free(Sq); free(hd); free(hi);
+    free(qr); free(Sq); free(qu8); free(hd); free(hi);
     return hn;
 }

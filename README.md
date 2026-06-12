@@ -262,3 +262,27 @@ Cumulative HNSW progression @ ef=100: 8,154 (scalar) -> 10,652 (AVX-512)
 -> 11,411 (prefetch) -> 12,727 (link arena). The flat-scan win over FAISS
 holds for this batch size (200 queries) and machine, single-threaded;
 FAISS's BLAS-backed path may behave differently at other shapes.
+
+## VNNI int8 scan for 8-bit codes
+
+The 8-bit scan was gather-bound (`vpgatherdps`, ~1 element/cycle). Fix: at
+encode time, snap each Lloyd-Max reconstruction onto a signed int8 grid and
+store that value directly; at query time, quantize the rotated query to int8
+once. The scan becomes `vpdpbusd` (AVX512-VNNI) — 64 MACs per instruction,
+zero gathers. The unsigned-operand offset is corrected with a per-vector
+`sum(x_i8)` stored at encode (+4 B/vec); `csq` and the QJL residual are
+computed from the *stored* int8 values, so the distance decomposition stays
+exact w.r.t. what the scan computes.
+
+| 8-bit scan        | QPS   | recall@10 | +rerank-100      |
+|-------------------|-------|-----------|------------------|
+| gather (before)   |   467 | 0.961     | 1.000            |
+| VNNI (after)      | 4,993 | 0.937     | 1.000 @ 2,583 qps|
+| faiss SQ8         | 1,988 | 0.966     | —                |
+
+10.7x faster; the 0.024 raw-recall cost (int8 grid + int8 query noise) is
+fully recovered by re-ranking. The VNNI path is now 2.2x faster than even
+the 4-bit register-LUT scan — two dpbusd instructions per vector beat eight
+permute+FMA iterations. QJL encode matvecs are also SIMD now (build 0.6s ->
+0.33s). Falls back to scalar (and to the float path) when AVX512-VNNI is
+absent or pdim isn't a multiple of 64.
