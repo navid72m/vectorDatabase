@@ -427,6 +427,65 @@ int64_t vecdb_add(VecDB *db, uint64_t id, const float *vec)
 }
 
 /* ------------------------------------------------------------------ */
+/* Delete                                                               */
+/* ------------------------------------------------------------------ */
+int vecdb_delete(VecDB *db, uint64_t id) {
+    if (!db) return -1;
+    /* locate internal index */
+    uint32_t idx = UINT32_MAX;
+    for (size_t i = 0; i < db->count; i++) {
+        if (db->ids[i] == id) { idx = (uint32_t)i; break; }
+    }
+    if (idx == UINT32_MAX) return -1; /* not found */
+
+    /* swap with last element to keep storage dense */
+    uint32_t last = (uint32_t)(db->count - 1);
+    if (idx != last) {
+        /* copy vector data */
+        memcpy(db->vecs + (size_t)idx * db->dim,
+               db->vecs + (size_t)last * db->dim,
+               (size_t)db->dim * sizeof(float));
+        db->vnorms[idx] = db->vnorms[last];
+        db->ids[idx] = db->ids[last];
+        db->node_level[idx] = db->node_level[last];
+        /* copy level‑0 links */
+        uint32_t *L_src = node_links(db, last, 0);
+        uint32_t *L_dst = node_links(db, idx, 0);
+        memcpy(L_dst, L_src, db->l0_stride * sizeof(uint32_t));
+        /* copy upper links if any */
+        if (db->upper[last]) {
+            if (!db->upper[idx])
+                db->upper[idx] = calloc((size_t)db->node_level[idx] * (size_t)(db->M + 2), sizeof(uint32_t));
+            memcpy(db->upper[idx], db->upper[last],
+                   (size_t)db->node_level[last] * (size_t)(db->M + 2) * sizeof(uint32_t));
+        } else {
+            if (db->upper[idx]) { free(db->upper[idx]); db->upper[idx] = NULL; }
+        }
+        free(db->upper[last]);
+        db->upper[last] = NULL;
+    }
+    /* free links of the removed node */
+    free(db->upper[last]);
+    db->upper[last] = NULL;
+
+    /* decrement count */
+    db->count--;
+
+    /* fix entry point if it pointed to moved node */
+    if (db->entry == (int64_t)last) db->entry = (int64_t)idx;
+    else if (db->entry == (int64_t)idx) db->entry = (int64_t)idx; // unchanged
+
+    /* recompute max_level if needed */
+    if ((int)idx == db->max_level) {
+        int new_max = 0;
+        for (size_t i = 0; i < db->count; i++)
+            if ((int)db->node_level[i] > new_max) new_max = db->node_level[i];
+        db->max_level = new_max;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Search                                                              */
 /* ------------------------------------------------------------------ */
 static void emit_topk(const VecDB *db, Heap *res, int k, VecResult *out, int *n_out)

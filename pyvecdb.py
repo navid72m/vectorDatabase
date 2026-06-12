@@ -56,6 +56,10 @@ _lib.vecdb_save.restype = c_int
 _lib.vecdb_load.argtypes = [c_char_p]
 _lib.vecdb_load.restype = c_void_p
 
+# Delete support
+_lib.vecdb_delete.argtypes = [c_void_p, c_uint64]
+_lib.vecdb_delete.restype = c_int
+
 
 def _as_f32_matrix(x: np.ndarray, dim: int) -> np.ndarray:
     x = np.ascontiguousarray(x, dtype=np.float32)
@@ -115,34 +119,15 @@ class VecDB:
     def delete(self, ids: np.ndarray) -> None:
         """Delete vectors by their IDs.
 
-        The underlying C library does not currently support in‑place deletion for HNSW
-        indexes (it would require tombstones and a repair step). This wrapper provides a
-        simple, safe fallback:
-
-        * The IDs are removed from the index by rebuilding a new index that contains
-          all vectors except the ones listed in ``ids``.
-        * This operation is O(N) in the number of stored vectors and copies the data
-          into a fresh ``VecDB`` instance.
-        * It is not the most efficient approach for large collections, but it fulfills
-          the functional requirement without modifying the C layer.
-        * The method mutates the current ``VecDB`` object in‑place: after deletion the
-          original handle is freed and replaced with the new one.
+        Calls the underlying C ``vecdb_delete`` for each ID. If any deletion fails
+        (e.g., the ID is not present) a ``RuntimeError`` is raised.
         """
-        # Ensure ids is an array of uint64
         ids = np.ascontiguousarray(ids, dtype=np.uint64)
-        # Retrieve all existing vectors and their IDs by performing a flat search on
-        # the entire index. ``self.search`` with ``exact=True`` returns all stored IDs
-        # in deterministic order.
-        all_ids = np.arange(len(self), dtype=np.uint64)
-        # NOTE: The C library does not expose a direct getter for raw vectors, so we
-        # rely on the fact that the Python wrapper only ever stores vectors that were
-        # added via ``add``. For a true delete implementation, the C side would need a
-        # ``vecdb_get`` function. Until then, we raise a clear error.
-        raise NotImplementedError(
-            "Delete operation requires access to stored vectors, which is not exposed "
-            "by the current C API. Implementing delete would need a new C function "
-            "(e.g., vecdb_get) or external storage of vectors."
-        )
+        for i in range(ids.shape[0]):
+            rc = _lib.vecdb_delete(self._h, int(ids[i]))
+            if rc != 0:
+                raise RuntimeError(f"vecdb_delete failed for id {ids[i]}")
+
 
     # -- reads ---------------------------------------------------------
     def search(self, queries: np.ndarray, k: int = 10, ef: int = 100,

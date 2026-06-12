@@ -35,6 +35,9 @@ void   vecdb_free(VecDB *db);
 /* Insert one vector. Returns internal index (>=0) or -1 on error. */
 int64_t vecdb_add(VecDB *db, uint64_t id, const float *vec);
 
+/* Delete a vector by its user‑supplied id. Returns 0 on success, -1 if id not found. */
+int vecdb_delete(VecDB *db, uint64_t id);
+
 size_t vecdb_count(const VecDB *db);
 int    vecdb_dim(const VecDB *db);
 
