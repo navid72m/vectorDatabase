@@ -1,5 +1,7 @@
 # vecdb — a small vector database in C
 
+![CI](https://github.com/navid72m/vectorDatabase/actions/workflows/ci.yml/badge.svg)
+
 `vecdb` is a dependency-light vector index implemented in C11 with Python bindings through `ctypes`. It stores fixed-size `float32` vectors and supports exact and approximate nearest-neighbor search using squared L2 distance.
 
 ## What it implements
@@ -9,6 +11,8 @@
 - **HNSW approximate search** — graph index using greedy descent, beam search (`ef`), and heuristic neighbor selection.
 - **Binary persistence** — save/load an index with vectors, IDs, levels, and neighbor links.
 - **Delete API** — O(1) tombstone deletes by user ID, with stable recall under churn and a `compact()` rebuild to reclaim space.
+- **Filtered search** — restrict any search to an allow-list or away from a deny-list of IDs; HNSW traverses through filtered nodes so selective filters cannot disconnect the search.
+- **Concurrent reads** — searches are thread-safe (per-thread visited buffers, no shared mutable state); any number of threads may search one index simultaneously. Writes require external exclusion.
 - **TurboQuant compressed index** — optional 4-bit or 8-bit compressed brute-force index with randomized Hadamard rotation, norm separation, Lloyd-Max Gaussian quantization, and optional QJL residual estimation.
 
 The C API is declared in `vecdb.h`. The Python API lives in `pyvecdb.py` and loads `libvecdb.so` from the project directory by default.
@@ -109,6 +113,8 @@ db.add(vectors, ids=None)          # returns None; ids default to current_count.
 db.delete(ids)                     # O(1) per id; raises RuntimeError if any id is missing
 db.compact()                       # rebuild without tombstones after many deletes
 ids, distances = db.search(queries, k=10, ef=100, exact=False)
+ids, distances = db.search(queries, k=10, allow_ids=some_ids)   # filtered
+ids, distances = db.search(queries, k=10, deny_ids=other_ids)
 db.save(path)
 loaded = VecDB.load(path)
 len(db)                            # number of stored vectors
@@ -283,7 +289,11 @@ Core C functions:
 | `vecdb_dim(db)` | Vector dimensionality |
 | `vecdb_search_flat(db, query, k, out)` | Exact single-query search |
 | `vecdb_search_flat_batch(db, queries, nq, k, out)` | Exact batched search over up to 8 queries per pass |
-| `vecdb_search_hnsw(db, query, k, ef, out)` | Approximate HNSW search |
+| `vecdb_search_hnsw(db, query, k, ef, out)` | Approximate HNSW search (thread-safe for concurrent reads) |
+| `vecdb_search_hnsw_filtered(db, query, k, ef, mask, out)` | HNSW search restricted to a slot mask |
+| `vecdb_search_flat_batch_filtered(db, queries, nq, k, mask, out)` | Exact filtered batch scan |
+| `vecdb_make_mask(db, ids, n, mode, mask)` | Build an allow (mode 0) or deny (mode 1) mask from user IDs |
+| `vecdb_slots(db)` | Mask size in bytes (internal slot count incl. tombstones) |
 | `vecdb_save(db, path)` | Persist vectors and graph |
 | `vecdb_load(path)` | Load a persisted index |
 
@@ -315,7 +325,8 @@ Distances returned by `TQIndex.search()` are estimated squared L2 distances for 
 
 ## Known limits
 
-- Single-threaded indexing and search.
+- Single writer: add/delete/compact must be externally excluded from each other and from searches. Concurrent searches are safe.
+- Very selective allow-lists (under ~1% of vectors) can return fewer than k HNSW results; use `exact=True` or raise `ef` for those.
 - Tombstoned slots are not reused by inserts; memory is reclaimed only by `compact()`. Long-running high-churn workloads should compact periodically.
 - `compact()` rebuilds the whole graph (O(N log N) inserts), so it is a maintenance operation, not a per-delete cost.
 - TurboQuant is a brute-force compressed index; it does not build an HNSW graph.
@@ -332,7 +343,8 @@ pyvecdb.py     # ctypes Python bindings
 bench.c        # small random-data smoke/demo program
 Makefile       # build rules for libvecdb.so and bench
 pyproject.toml # Python package metadata
-tests.py       # correctness + churn test suite (python tests.py)
+tests.py       # correctness, churn, filtering, concurrency suite (python tests.py)
+.github/       # CI: build + full test suite on every push
 benchmarks/    # FAISS/Chroma/Qdrant comparison + quantization shoot-out
 ```
 

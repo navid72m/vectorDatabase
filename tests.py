@@ -10,6 +10,10 @@ import numpy as np
 from pyvecdb import VecDB, TQIndex
 
 FAILS = 0
+def _raises(fn):
+    try: fn(); return False
+    except Exception: return True
+
 def check(name, cond, detail=""):
     global FAILS
     print(f"  [{'ok' if cond else 'FAIL'}] {name}" + (f" ({detail})" if detail else ""))
@@ -32,10 +36,6 @@ rec = np.mean([len(set(a.tolist()) & set(b.tolist()))/10
 check("hnsw recall@10 >= 0.95 at ef=200", rec >= 0.95, f"{rec:.3f}")
 check("duplicate live id rejected",
       (lambda: (_raises(lambda: db.add(X[:1], np.array([0], dtype=np.uint64)))))())
-
-def _raises(fn):
-    try: fn(); return False
-    except Exception: return True
 
 # ---------------------------------------------------------------- deletes
 print("deletes:")
@@ -126,6 +126,46 @@ for bits in (4, 8):
     check(f"{bits}-bit self-NN", (ti[:, 0] == np.arange(20)).all())
 t = TQIndex(128, bits=4, qjl=True); t.add(Xt[:500])
 check("qjl mode runs", t.search(Xt[:2], k=5)[0].shape == (2, 5))
+
+# ---------------------------------------------------------------- filtered search
+print("filtered search:")
+Xf = rng.standard_normal((4000, 64)).astype(np.float32)
+dbf = VecDB(dim=64); dbf.add(Xf)
+Qf = rng.standard_normal((30, 64)).astype(np.float32)
+allow = rng.choice(4000, 800, replace=False).astype(np.uint64)
+allow_set = set(allow.tolist())
+fi, _ = dbf.search(Qf, k=10, ef=200, allow_ids=allow)
+check("hnsw allow-list: results subset of allow",
+      all(int(x) in allow_set for row in fi for x in row if int(x) != 2**64-1))
+ei, _ = dbf.search(Qf, k=10, exact=True, allow_ids=allow)
+Df = ((Qf[:, None, :] - Xf[allow][None, :, :]) ** 2).sum(-1)
+gtf = allow[np.argsort(Df, axis=1)[:, :10]]
+check("exact allow-list matches numpy",
+      np.array_equal(ei.astype(np.int64), gtf.astype(np.int64)))
+recf = np.mean([len(set(a.tolist()) & set(b.tolist()))/10
+                for a, b in zip(fi.astype(np.int64), gtf.astype(np.int64))])
+check("hnsw allow-list recall >= 0.9 (20% selectivity)", recf >= 0.9, f"{recf:.3f}")
+deny = allow
+di, _ = dbf.search(Qf, k=10, ef=200, deny_ids=deny)
+check("deny-list: no denied ids in results",
+      all(int(x) not in allow_set for row in di for x in row))
+
+# ---------------------------------------------------------------- concurrent search
+print("concurrent search:")
+import threading
+Xs = rng.standard_normal((5000, 64)).astype(np.float32)
+dbs = VecDB(dim=64); dbs.add(Xs)
+Qss = rng.standard_normal((40, 64)).astype(np.float32)
+ref, _ = dbs.search(Qss, k=10, ef=100)
+results = [None] * 4
+def worker(t_):
+    out = [dbs.search(Qss, k=10, ef=100)[0] for _ in range(5)]
+    results[t_] = out
+threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+for th in threads: th.start()
+for th in threads: th.join()
+ok = all(np.array_equal(r, ref) for outs in results for r in outs)
+check("4 threads x 5 searches all match single-threaded reference", ok)
 
 print(f"\n{'ALL TESTS PASS' if FAILS == 0 else f'{FAILS} FAILURES'}")
 sys.exit(1 if FAILS else 0)

@@ -154,10 +154,33 @@ struct VecDB {
     size_t    map_cap;           /* power of two                       */
     size_t    map_used;
 
-    /* per-query visited marks (epoch trick, no memset per query)     */
-    uint32_t *visited;
-    uint32_t  epoch;
 };
+
+/* Per-THREAD visited marks (epoch trick, no memset per query).
+ * Thread-local rather than per-db: searches mutate no shared state, so
+ * any number of threads may search the same index concurrently.
+ * (Writes — add/delete/compact — still require external exclusion.)
+ * The buffer is sized to the largest capacity seen by this thread and
+ * is intentionally never freed (lives until thread exit).             */
+static _Thread_local uint32_t *tls_vis = NULL;
+static _Thread_local size_t    tls_vis_cap = 0;
+static _Thread_local uint32_t  tls_epoch = 0;
+
+static uint32_t *visited_acquire(size_t cap, uint32_t *epoch_out)
+{
+    if (tls_vis_cap < cap) {
+        free(tls_vis);
+        tls_vis = calloc(cap, sizeof(uint32_t));
+        tls_vis_cap = cap;
+        tls_epoch = 0;
+    }
+    if (++tls_epoch == 0) {                  /* epoch wrapped: clear once */
+        memset(tls_vis, 0, tls_vis_cap * sizeof(uint32_t));
+        tls_epoch = 1;
+    }
+    *epoch_out = tls_epoch;
+    return tls_vis;
+}
 
 /* splitmix64 finalizer */
 static uint64_t hash_u64(uint64_t x)
@@ -282,10 +305,8 @@ VecDB *vecdb_create(const VecDBConfig *cfg)
     db->upper   = calloc(db->cap, sizeof(uint32_t *));
     db->node_level = calloc(db->cap, 1);
     db->dead    = calloc(db->cap, 1);
-    db->visited = calloc(db->cap, sizeof(uint32_t));
     db->entry = -1;
     db->max_level = -1;
-    db->epoch = 0;
     return db;
 }
 
@@ -295,7 +316,7 @@ void vecdb_free(VecDB *db)
     for (size_t i = 0; i < db->count; i++) free(db->upper[i]);
     free(db->upper); free(db->node_level); free(db->l0); free(db->dead);
     free(db->map_keys); free(db->map_vals); free(db->map_state);
-    free(db->vecs); free(db->vnorms); free(db->ids); free(db->visited);
+    free(db->vecs); free(db->vnorms); free(db->ids);
     free(db);
 }
 
@@ -312,32 +333,29 @@ static void grow(VecDB *db)
     db->upper   = realloc(db->upper,  ncap * sizeof(uint32_t *));
     db->node_level = realloc(db->node_level, ncap);
     db->dead    = realloc(db->dead, ncap);
-    db->visited = realloc(db->visited, ncap * sizeof(uint32_t));
     memset(db->upper + db->cap, 0, (ncap - db->cap) * sizeof(uint32_t *));
     memset(db->node_level + db->cap, 0, ncap - db->cap);
     memset(db->dead + db->cap, 0, ncap - db->cap);
-    memset(db->visited + db->cap, 0, (ncap - db->cap) * sizeof(uint32_t));
     db->cap = ncap;
 }
 
 static int link_cap(const VecDB *db, int level) { return level == 0 ? db->M0 : db->M; }
 
 /* Greedy beam search on one layer. Results land in `res` (max-heap, size<=ef). */
-static void search_layer(VecDB *db, const float *q, uint32_t entry, int ef,
-                         int level, Heap *res, int filter_dead)
+static void search_layer(const VecDB *db, const float *q, uint32_t entry, int ef,
+                         int level, Heap *res, int filter_dead,
+                         const uint8_t *mask /* NULL or count bytes, 1=allowed */)
 {
-    db->epoch++;
-    if (db->epoch == 0) {            /* wrapped: clear marks once */
-        memset(db->visited, 0, db->cap * sizeof(uint32_t));
-        db->epoch = 1;
-    }
+    uint32_t epoch;
+    uint32_t *visited = visited_acquire(db->cap, &epoch);
 
     Heap cand; heap_init(&cand, ef + 1, 0);   /* min-heap: closest first */
 
     float d0 = l2sq(q, vec_at(db, entry), db->dim);
-    db->visited[entry] = db->epoch;
+    visited[entry] = epoch;
     heap_push(&cand, d0, entry);
-    if (!filter_dead || !db->dead[entry]) heap_push(res, d0, entry);
+    if ((!filter_dead || !db->dead[entry]) && (!mask || mask[entry]))
+        heap_push(res, d0, entry);
 
     while (cand.n > 0) {
         HItem c = heap_pop(&cand);
@@ -346,23 +364,23 @@ static void search_layer(VecDB *db, const float *q, uint32_t entry, int ef,
         const uint32_t *L = node_links(db, c.node, level);
         uint32_t n = L[0];
         if (n) {                                /* one-ahead prefetch pattern */
-            __builtin_prefetch(&db->visited[L[1]], 0, 3);
+            __builtin_prefetch(&visited[L[1]], 0, 3);
             __builtin_prefetch(vec_at(db, L[1]), 0, 3);
         }
         for (uint32_t j = 1; j <= n; j++) {
             if (j < n) {                        /* prefetch next while computing */
-                __builtin_prefetch(&db->visited[L[j+1]], 0, 3);
+                __builtin_prefetch(&visited[L[j+1]], 0, 3);
                 const float *pn = vec_at(db, L[j+1]);
                 __builtin_prefetch(pn, 0, 3);
                 __builtin_prefetch((const char *)pn + 64, 0, 3);
             }
             uint32_t nb = L[j];
-            if (db->visited[nb] == db->epoch) continue;
-            db->visited[nb] = db->epoch;
+            if (visited[nb] == epoch) continue;
+            visited[nb] = epoch;
             float d = l2sq(q, vec_at(db, nb), db->dim);
             if (res->n < ef || d < res->a[0].dist) {
                 heap_push(&cand, d, nb);
-                if (!filter_dead || !db->dead[nb]) {
+                if ((!filter_dead || !db->dead[nb]) && (!mask || mask[nb])) {
                     heap_push(res, d, nb);
                     if (res->n > ef) heap_pop(res);
                 }
@@ -373,7 +391,7 @@ static void search_layer(VecDB *db, const float *q, uint32_t entry, int ef,
 }
 
 /* Pure greedy descent (ef=1) used on layers above the target. */
-static uint32_t greedy_step(VecDB *db, const float *q, uint32_t entry, int level)
+static uint32_t greedy_step(const VecDB *db, const float *q, uint32_t entry, int level)
 {
     uint32_t cur = entry;
     float best = l2sq(q, vec_at(db, cur), db->dim);
@@ -483,7 +501,7 @@ int64_t vecdb_add(VecDB *db, uint64_t id, const float *vec)
     int start = level < db->max_level ? level : db->max_level;
     for (int l = start; l >= 0; l--) {
         Heap res; heap_init(&res, db->ef_construction + 1, 1);
-        search_layer(db, vec, ep, db->ef_construction, l, &res, 0);
+        search_layer(db, vec, ep, db->ef_construction, l, &res, 0, NULL);
 
         int M = db->M;  /* links to create from the new node */
         uint32_t *sel = malloc((size_t)M * sizeof(uint32_t));
@@ -620,8 +638,8 @@ static void dots_block(const float *x, const float *const *qrows, int qb,
 }
 #endif
 
-int vecdb_search_flat_batch(const VecDB *db, const float *queries, int nq,
-                            int k, VecResult *out)
+static int flat_batch_impl(const VecDB *db, const float *queries, int nq,
+                           int k, const uint8_t *mask, VecResult *out)
 {
     if (!db || db->alive == 0 || k <= 0 || nq <= 0) return 0;
     int kk = (size_t)k > db->alive ? (int)db->alive : k;
@@ -640,7 +658,7 @@ int vecdb_search_flat_batch(const VecDB *db, const float *queries, int nq,
         }
 
         for (size_t v = 0; v < db->count; v++) {
-            if (db->dead[v]) continue;
+            if (db->dead[v] || (mask && !mask[v])) continue;
             dots_block(vec_at(db, (uint32_t)v), qrows, qb, db->dim, dots);
             float xn = db->vnorms[v];
             for (int j = 0; j < qb; j++) {
@@ -666,9 +684,22 @@ int vecdb_search_flat_batch(const VecDB *db, const float *queries, int nq,
     return kk;
 }
 
-int vecdb_search_hnsw(const VecDB *db_const, const float *query, int k, int ef, VecResult *out)
+int vecdb_search_flat_batch(const VecDB *db, const float *queries, int nq,
+                            int k, VecResult *out)
 {
-    VecDB *db = (VecDB *)db_const;   /* mutates visited/epoch only */
+    return flat_batch_impl(db, queries, nq, k, NULL, out);
+}
+
+int vecdb_search_flat_batch_filtered(const VecDB *db, const float *queries,
+                                     int nq, int k, const uint8_t *mask,
+                                     VecResult *out)
+{
+    return flat_batch_impl(db, queries, nq, k, mask, out);
+}
+
+static int hnsw_search_impl(const VecDB *db, const float *query, int k, int ef,
+                            const uint8_t *qmask, VecResult *out)
+{
     if (!db || db->alive == 0 || k <= 0) return 0;
     if (ef < k) ef = k;
 
@@ -677,10 +708,47 @@ int vecdb_search_hnsw(const VecDB *db_const, const float *query, int k, int ef, 
         ep = greedy_step(db, query, ep, l);
 
     Heap res; heap_init(&res, ef + 1, 1);
-    search_layer(db, query, ep, ef, 0, &res, 1);
+    search_layer(db, query, ep, ef, 0, &res, 1, qmask);
     int n; emit_topk(db, &res, k, out, &n);
     heap_destroy(&res);
     return n;
+}
+
+int vecdb_search_hnsw(const VecDB *db, const float *query, int k, int ef, VecResult *out)
+{
+    return hnsw_search_impl(db, query, k, ef, NULL, out);
+}
+
+/* Filtered HNSW search: mask has vecdb_slots() bytes, 1 = candidate allowed.
+ * The graph is traversed normally (through disallowed nodes) so selective
+ * filters do not disconnect the search; only results are restricted.
+ * For very selective filters (<1% allowed), prefer the exact filtered scan
+ * or raise ef — the beam may otherwise terminate with fewer than k hits.  */
+int vecdb_search_hnsw_filtered(const VecDB *db, const float *query, int k, int ef,
+                               const uint8_t *mask, VecResult *out)
+{
+    return hnsw_search_impl(db, query, k, ef, mask, out);
+}
+
+size_t vecdb_slots(const VecDB *db) { return db ? db->count : 0; }
+
+/* Build a slot mask (count bytes) from user ids.
+ * mode 0: allow-list (mask starts 0, listed ids set to 1)
+ * mode 1: deny-list  (mask starts 1, listed ids set to 0)
+ * Unknown ids are ignored. Returns number of ids resolved.             */
+int64_t vecdb_make_mask(const VecDB *db, const uint64_t *ids, size_t n,
+                        int mode, uint8_t *mask)
+{
+    if (!db || !mask) return -1;
+    memset(mask, mode ? 1 : 0, db->count);
+    int64_t hit = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t s = map_get(db, ids[i]);
+        if (s == UINT32_MAX) continue;
+        mask[s] = mode ? 0 : 1;
+        hit++;
+    }
+    return hit;
 }
 
 /* ------------------------------------------------------------------ */

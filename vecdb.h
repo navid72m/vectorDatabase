@@ -55,8 +55,26 @@ int vecdb_search_flat(const VecDB *db, const float *query, int k, VecResult *out
 int vecdb_search_flat_batch(const VecDB *db, const float *queries, int nq,
                             int k, VecResult *out);
 
-/* Approximate search via HNSW. ef >= k controls accuracy/speed. */
+/* Approximate search via HNSW. ef >= k controls accuracy/speed.
+ * Thread-safe: any number of threads may search concurrently; writes
+ * (add/delete/compact) require external exclusion from searches. */
 int vecdb_search_hnsw(const VecDB *db, const float *query, int k, int ef, VecResult *out);
+
+/* ---- filtered search ----
+ * A mask is a byte per internal slot (vecdb_slots() bytes), 1 = allowed.
+ * Build one from user ids with vecdb_make_mask (mode 0 allow / 1 deny;
+ * returns the number of ids resolved, unknown ids are ignored).
+ * HNSW traverses through disallowed nodes (filters cannot disconnect the
+ * search) but excludes them from results. For very selective filters
+ * (<~1% allowed) prefer the exact filtered scan or raise ef. */
+size_t  vecdb_slots(const VecDB *db);
+int64_t vecdb_make_mask(const VecDB *db, const uint64_t *ids, size_t n,
+                        int mode, uint8_t *mask);
+int vecdb_search_hnsw_filtered(const VecDB *db, const float *query, int k, int ef,
+                               const uint8_t *mask, VecResult *out);
+int vecdb_search_flat_batch_filtered(const VecDB *db, const float *queries,
+                                     int nq, int k, const uint8_t *mask,
+                                     VecResult *out);
 
 /* Binary persistence (vectors + graph). Returns 0 on success. */
 int    vecdb_save(const VecDB *db, const char *path);

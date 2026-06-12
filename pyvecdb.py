@@ -51,6 +51,16 @@ _lib.vecdb_search_flat_batch.argtypes = [c_void_p, POINTER(c_float), c_int, c_in
 _lib.vecdb_search_flat_batch.restype = c_int
 _lib.vecdb_search_hnsw.argtypes = [c_void_p, POINTER(c_float), c_int, c_int, POINTER(_VecResult)]
 _lib.vecdb_search_hnsw.restype = c_int
+_lib.vecdb_search_hnsw_filtered.argtypes = [c_void_p, POINTER(c_float), c_int, c_int,
+                                            ctypes.c_char_p, POINTER(_VecResult)]
+_lib.vecdb_search_hnsw_filtered.restype = c_int
+_lib.vecdb_search_flat_batch_filtered.argtypes = [c_void_p, POINTER(c_float), c_int, c_int,
+                                                  ctypes.c_char_p, POINTER(_VecResult)]
+_lib.vecdb_search_flat_batch_filtered.restype = c_int
+_lib.vecdb_slots.argtypes = [c_void_p]
+_lib.vecdb_slots.restype = c_size_t
+_lib.vecdb_make_mask.argtypes = [c_void_p, POINTER(c_uint64), c_size_t, c_int, ctypes.c_char_p]
+_lib.vecdb_make_mask.restype = c_int64
 _lib.vecdb_save.argtypes = [c_void_p, c_char_p]
 _lib.vecdb_save.restype = c_int
 _lib.vecdb_load.argtypes = [c_char_p]
@@ -138,18 +148,39 @@ class VecDB:
 
 
     # -- reads ---------------------------------------------------------
+    def _make_mask(self, allow_ids, deny_ids) -> bytes | None:
+        if allow_ids is None and deny_ids is None:
+            return None
+        if allow_ids is not None and deny_ids is not None:
+            raise ValueError("pass allow_ids or deny_ids, not both")
+        ids = np.ascontiguousarray(
+            np.atleast_1d(allow_ids if allow_ids is not None else deny_ids),
+            dtype=np.uint64)
+        mode = 0 if allow_ids is not None else 1
+        mask = ctypes.create_string_buffer(_lib.vecdb_slots(self._h))
+        _lib.vecdb_make_mask(self._h, ids.ctypes.data_as(POINTER(c_uint64)),
+                             ids.shape[0], mode, mask)
+        return mask
+
     def search(self, queries: np.ndarray, k: int = 10, ef: int = 100,
-               exact: bool = False) -> tuple[np.ndarray, np.ndarray]:
+               exact: bool = False, allow_ids=None,
+               deny_ids=None) -> tuple[np.ndarray, np.ndarray]:
         """Returns (ids, dists), each shaped (nq, k). dist = squared L2.
-        Missing slots (k > count) are id=2^64-1, dist=inf."""
+        Missing slots (k > count) are id=2^64-1, dist=inf.
+        allow_ids / deny_ids restrict results to (or away from) the given
+        user ids. For very selective allow-lists prefer exact=True."""
         queries = _as_f32_matrix(queries, self.dim)
         nq = queries.shape[0]
         out_ids = np.full((nq, k), np.iinfo(np.uint64).max, dtype=np.uint64)
         out_dists = np.full((nq, k), np.inf, dtype=np.float32)
         qp = queries.ctypes.data_as(POINTER(c_float))
+        mask = self._make_mask(allow_ids, deny_ids)
         if exact:                      # single C call, blocked over queries
             buf = (_VecResult * (nq * k))()
-            n = _lib.vecdb_search_flat_batch(self._h, qp, nq, k, buf)
+            if mask is None:
+                n = _lib.vecdb_search_flat_batch(self._h, qp, nq, k, buf)
+            else:
+                n = _lib.vecdb_search_flat_batch_filtered(self._h, qp, nq, k, mask, buf)
             for i in range(nq):
                 for j in range(n):
                     out_ids[i, j] = buf[i * k + j].id
@@ -159,7 +190,10 @@ class VecDB:
         for i in range(nq):
             qrow = ctypes.cast(ctypes.addressof(qp.contents) + i * self.dim * 4,
                                POINTER(c_float))
-            n = _lib.vecdb_search_hnsw(self._h, qrow, k, ef, buf)
+            if mask is None:
+                n = _lib.vecdb_search_hnsw(self._h, qrow, k, ef, buf)
+            else:
+                n = _lib.vecdb_search_hnsw_filtered(self._h, qrow, k, ef, mask, buf)
             for j in range(n):
                 out_ids[i, j] = buf[j].id
                 out_dists[i, j] = buf[j].dist
