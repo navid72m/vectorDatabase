@@ -16,10 +16,17 @@ endif
 
 CFLAGS  ?= -O3 $(ARCHFLAGS) -fPIC -Wall -Wextra
 
+# make OMP=1 enables OpenMP-parallel batch search (Linux/gcc; on macOS
+# install libomp and use: make OMP=1 CC=gcc-14, or see README)
+ifdef OMP
+    CFLAGS  += -fopenmp
+    OMPLD    = -fopenmp
+endif
+
 all: libvecdb.so
 
 libvecdb.so: $(OBJ)
-	$(CC) $(LDSHARED) -o $@ $^ -lm
+	$(CC) $(LDSHARED) $(OMPLD) -o $@ $^ -lm
 
 %.o: %.c vecdb.h turboquant.h
 	$(CC) $(CFLAGS) -c $< -o $@

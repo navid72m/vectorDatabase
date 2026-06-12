@@ -11,9 +11,20 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install numpy
         run: pip install numpy
-      - name: Build library and bench
+      - name: Build and test (serial)
         run: |
           make
           make bench
-      - name: Run test suite
-        run: python3 tests.py
+          python3 tests.py
+      - name: Build and test (OpenMP)
+        run: |
+          make clean
+          make OMP=1
+          OMP_NUM_THREADS=4 python3 tests.py
+      - name: NEON kernels under QEMU (aarch64 cross-build)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gcc-aarch64-linux-gnu qemu-user-static
+          aarch64-linux-gnu-gcc -O3 -march=armv8.2-a+dotprod -Wall \
+            vecdb.c turboquant.c test_kernels.c -o tk_arm -lm -static
+          qemu-aarch64-static ./tk_arm

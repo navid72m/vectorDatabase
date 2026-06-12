@@ -57,6 +57,9 @@ _lib.vecdb_search_hnsw_filtered.restype = c_int
 _lib.vecdb_search_flat_batch_filtered.argtypes = [c_void_p, POINTER(c_float), c_int, c_int,
                                                   ctypes.c_char_p, POINTER(_VecResult)]
 _lib.vecdb_search_flat_batch_filtered.restype = c_int
+_lib.vecdb_search_hnsw_batch.argtypes = [c_void_p, POINTER(c_float), c_int, c_int,
+                                          c_int, ctypes.c_char_p, POINTER(_VecResult)]
+_lib.vecdb_search_hnsw_batch.restype = c_int
 _lib.vecdb_slots.argtypes = [c_void_p]
 _lib.vecdb_slots.restype = c_size_t
 _lib.vecdb_make_mask.argtypes = [c_void_p, POINTER(c_uint64), c_size_t, c_int, ctypes.c_char_p]
@@ -186,17 +189,12 @@ class VecDB:
                     out_ids[i, j] = buf[i * k + j].id
                     out_dists[i, j] = buf[i * k + j].dist
             return out_ids, out_dists
-        buf = (_VecResult * k)()
+        buf = (_VecResult * (nq * k))()       # one C call, OpenMP inside
+        _lib.vecdb_search_hnsw_batch(self._h, qp, nq, k, ef, mask, buf)
         for i in range(nq):
-            qrow = ctypes.cast(ctypes.addressof(qp.contents) + i * self.dim * 4,
-                               POINTER(c_float))
-            if mask is None:
-                n = _lib.vecdb_search_hnsw(self._h, qrow, k, ef, buf)
-            else:
-                n = _lib.vecdb_search_hnsw_filtered(self._h, qrow, k, ef, mask, buf)
-            for j in range(n):
-                out_ids[i, j] = buf[j].id
-                out_dists[i, j] = buf[j].dist
+            for j in range(k):
+                out_ids[i, j] = buf[i * k + j].id
+                out_dists[i, j] = buf[i * k + j].dist
         return out_ids, out_dists
 
     # -- persistence ---------------------------------------------------
@@ -226,6 +224,8 @@ _lib.tq_count.argtypes = [c_void_p]
 _lib.tq_count.restype = c_size_t
 _lib.tq_search.argtypes = [c_void_p, POINTER(c_float), c_int, POINTER(_VecResult)]
 _lib.tq_search.restype = c_int
+_lib.tq_search_batch.argtypes = [c_void_p, POINTER(c_float), c_int, c_int, POINTER(_VecResult)]
+_lib.tq_search_batch.restype = c_int
 _lib.tq_memory_bytes.argtypes = [c_void_p]
 _lib.tq_memory_bytes.restype = c_size_t
 
@@ -276,13 +276,11 @@ class TQIndex:
         nq = queries.shape[0]
         out_ids = np.zeros((nq, k), dtype=np.uint64)
         out_dists = np.full((nq, k), np.inf, dtype=np.float32)
-        buf = (_VecResult * k)()
+        buf = (_VecResult * (nq * k))()       # one C call, OpenMP inside
         qp = queries.ctypes.data_as(POINTER(c_float))
+        _lib.tq_search_batch(self._h, qp, nq, k, buf)
         for i in range(nq):
-            row = ctypes.cast(ctypes.addressof(qp.contents) + i * self.dim * 4,
-                              POINTER(c_float))
-            m = _lib.tq_search(self._h, row, k, buf)
-            for j in range(m):
-                out_ids[i, j] = buf[j].id
-                out_dists[i, j] = buf[j].dist
+            for j in range(k):
+                out_ids[i, j] = buf[i * k + j].id
+                out_dists[i, j] = buf[i * k + j].dist
         return out_ids, out_dists

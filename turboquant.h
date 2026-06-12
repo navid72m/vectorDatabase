@@ -32,6 +32,10 @@ size_t   tq_count(const TQIndex *tq);
 /* Brute-force scan over quantized codes. Returns number of results. */
 int tq_search(const TQIndex *tq, const float *query, int k, VecResult *out);
 
+/* Batched scan, parallel over queries under OpenMP. */
+int tq_search_batch(const TQIndex *tq, const float *queries, int nq, int k,
+                    VecResult *out);
+
 /* Bytes used by codes+norms+ids (excludes struct overhead). */
 size_t tq_memory_bytes(const TQIndex *tq);
 

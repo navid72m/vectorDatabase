@@ -67,6 +67,11 @@ int vecdb_search_hnsw(const VecDB *db, const float *query, int k, int ef, VecRes
  * HNSW traverses through disallowed nodes (filters cannot disconnect the
  * search) but excludes them from results. For very selective filters
  * (<~1% allowed) prefer the exact filtered scan or raise ef. */
+/* Batched HNSW search (parallel over queries under OpenMP). mask may be
+ * NULL; out has nq*k slots, unfilled slots id=UINT64_MAX/dist=inf. */
+int vecdb_search_hnsw_batch(const VecDB *db, const float *queries, int nq,
+                            int k, int ef, const uint8_t *mask, VecResult *out);
+
 size_t  vecdb_slots(const VecDB *db);
 int64_t vecdb_make_mask(const VecDB *db, const uint64_t *ids, size_t n,
                         int mode, uint8_t *mask);

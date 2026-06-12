@@ -13,6 +13,8 @@
 - **Delete API** — O(1) tombstone deletes by user ID, with stable recall under churn and a `compact()` rebuild to reclaim space.
 - **Filtered search** — restrict any search to an allow-list or away from a deny-list of IDs; HNSW traverses through filtered nodes so selective filters cannot disconnect the search.
 - **Concurrent reads** — searches are thread-safe (per-thread visited buffers, no shared mutable state); any number of threads may search one index simultaneously. Writes require external exclusion.
+- **OpenMP batch search** — `make OMP=1` parallelizes batched HNSW, exact, and TurboQuant searches over queries. Single-threaded behavior is unchanged; results are identical either way.
+- **NEON kernels** — on AArch64 (Apple Silicon, Graviton, ...) the distance kernel, blocked exact scan, and both TurboQuant scans use NEON; the 4-bit codebook decodes via a single `tbl` table register and both quantized scans run on `sdot` (signed x signed, so no zero-point correction). Verified against scalar references under QEMU in CI.
 - **TurboQuant compressed index** — optional 4-bit or 8-bit compressed brute-force index with randomized Hadamard rotation, norm separation, Lloyd-Max Gaussian quantization, and optional QJL residual estimation.
 
 The C API is declared in `vecdb.h`. The Python API lives in `pyvecdb.py` and loads `libvecdb.so` from the project directory by default.
@@ -319,8 +321,9 @@ Distances returned by `TQIndex.search()` are estimated squared L2 distances for 
 - HNSW uses deterministic seeded `xorshift64*` level sampling.
 - HNSW search uses epoch-tagged visited marks to avoid clearing a visited array per query.
 - Flat batch search uses the identity `||q - x||^2 = ||q||^2 - 2<q,x> + ||x||^2` with cached vector norms.
-- `vecdb.c` has an AVX-512 distance kernel when compiled with AVX-512; otherwise it falls back to scalar code that is intended to auto-vectorize under `-O3`.
-- `turboquant.c` has AVX-512 4-bit lookup and VNNI 8-bit scan paths when the compiler target supports them; otherwise it falls back to scalar scans.
+- `vecdb.c` has AVX-512 and NEON distance kernels; otherwise it falls back to scalar code that is intended to auto-vectorize under `-O3`.
+- `turboquant.c` scan paths by target: AVX-512 4-bit register-LUT + VNNI 8-bit on x86; NEON `tbl`+`sdot` for both bit-widths on AArch64 (requires the dotprod extension, ARMv8.2+); scalar otherwise. The NEON 4-bit path scans on the int8 grid (like the VNNI 8-bit path), trading a small amount of raw recall for speed; reranking recovers it.
+- OpenMP parallelism applies to batched searches only; index build remains single-threaded. macOS note: Apple clang has no bundled OpenMP — use `brew install gcc` and `make OMP=1 CC=gcc-14`, or build serial (default).
 - The Makefile uses `-march=native`, so build artifacts are machine-specific.
 
 ## Known limits

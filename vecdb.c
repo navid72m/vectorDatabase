@@ -47,6 +47,30 @@ static float l2sq(const float *restrict a, const float *restrict b, int dim)
     }
     return s;
 }
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#define VECDB_NEON 1
+static float l2sq(const float *restrict a, const float *restrict b, int dim)
+{
+    float32x4_t s0 = vdupq_n_f32(0.f), s1 = vdupq_n_f32(0.f);
+    float32x4_t s2 = vdupq_n_f32(0.f), s3 = vdupq_n_f32(0.f);
+    int i = 0;
+    for (; i + 16 <= dim; i += 16) {
+        float32x4_t d0 = vsubq_f32(vld1q_f32(a+i),    vld1q_f32(b+i));
+        float32x4_t d1 = vsubq_f32(vld1q_f32(a+i+4),  vld1q_f32(b+i+4));
+        float32x4_t d2 = vsubq_f32(vld1q_f32(a+i+8),  vld1q_f32(b+i+8));
+        float32x4_t d3 = vsubq_f32(vld1q_f32(a+i+12), vld1q_f32(b+i+12));
+        s0 = vfmaq_f32(s0, d0, d0); s1 = vfmaq_f32(s1, d1, d1);
+        s2 = vfmaq_f32(s2, d2, d2); s3 = vfmaq_f32(s3, d3, d3);
+    }
+    for (; i + 4 <= dim; i += 4) {
+        float32x4_t d = vsubq_f32(vld1q_f32(a+i), vld1q_f32(b+i));
+        s0 = vfmaq_f32(s0, d, d);
+    }
+    float s = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
+    for (; i < dim; i++) { float d = a[i] - b[i]; s += d*d; }
+    return s;
+}
 #else
 static float l2sq(const float *restrict a, const float *restrict b, int dim)
 {
@@ -626,6 +650,24 @@ static void dots_block(const float *x, const float *const *qrows, int qb,
     }
     for (int j = 0; j < qb; j++) dots[j] = _mm512_reduce_add_ps(acc[j]);
 }
+#elif defined(VECDB_NEON)
+static void dots_block(const float *x, const float *const *qrows, int qb,
+                       int dim, float *dots)
+{
+    float32x4_t acc[FLAT_QB];
+    for (int j = 0; j < qb; j++) acc[j] = vdupq_n_f32(0.f);
+    int i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        float32x4_t xv = vld1q_f32(x + i);
+        for (int j = 0; j < qb; j++)
+            acc[j] = vfmaq_f32(acc[j], xv, vld1q_f32(qrows[j] + i));
+    }
+    for (int j = 0; j < qb; j++) {
+        float s = vaddvq_f32(acc[j]);
+        for (int t = i; t < dim; t++) s += x[t] * qrows[j][t];
+        dots[j] = s;
+    }
+}
 #else
 static void dots_block(const float *x, const float *const *qrows, int qb,
                        int dim, float *dots)
@@ -644,7 +686,10 @@ static int flat_batch_impl(const VecDB *db, const float *queries, int nq,
     if (!db || db->alive == 0 || k <= 0 || nq <= 0) return 0;
     int kk = (size_t)k > db->alive ? (int)db->alive : k;
 
-    for (int q0 = 0; q0 < nq; q0 += FLAT_QB) {
+    int nblk = (nq + FLAT_QB - 1) / FLAT_QB;
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int blk = 0; blk < nblk; blk++) {
+        int q0 = blk * FLAT_QB;
         int qb = nq - q0 < FLAT_QB ? nq - q0 : FLAT_QB;
         const float *qrows[FLAT_QB];
         float qn[FLAT_QB], dots[FLAT_QB];
@@ -728,6 +773,22 @@ int vecdb_search_hnsw_filtered(const VecDB *db, const float *query, int k, int e
                                const uint8_t *mask, VecResult *out)
 {
     return hnsw_search_impl(db, query, k, ef, mask, out);
+}
+
+/* Batched HNSW search, parallel over queries when built with OpenMP.
+ * mask may be NULL. out has nq*k slots; unfilled slots get id=UINT64_MAX,
+ * dist=INFINITY. Returns k. */
+int vecdb_search_hnsw_batch(const VecDB *db, const float *queries, int nq,
+                            int k, int ef, const uint8_t *mask, VecResult *out)
+{
+    if (!db || k <= 0 || nq <= 0) return 0;
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int i = 0; i < nq; i++) {
+        VecResult *o = out + (size_t)i * k;
+        int n = hnsw_search_impl(db, queries + (size_t)i * db->dim, k, ef, mask, o);
+        for (int j = n; j < k; j++) { o[j].id = (uint64_t)-1; o[j].dist = INFINITY; }
+    }
+    return k;
 }
 
 size_t vecdb_slots(const VecDB *db) { return db ? db->count : 0; }

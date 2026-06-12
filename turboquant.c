@@ -88,6 +88,7 @@ struct TQIndex {
      * snapped to a signed-127 grid) so the scan can use AVX512-VNNI.    */
     float     lmax;   /* max |level|                           */
     float     s8x;    /* 127 / lmax: float -> int8 scale       */
+    int8_t    l8[16]; /* bits==4: codebook on the int8 grid (NEON tbl) */
     int32_t  *i8sums; /* count: sum of stored int8 (VNNI bias) */
 
     /* QJL residual stage (TurboQuant-prod, Alg. 2 of the paper)   */
@@ -130,6 +131,11 @@ TQIndex *tq_create2(int dim, int bits, int use_qjl, uint64_t seed)
         if (a > tq->lmax) tq->lmax = a;
     }
     tq->s8x = 127.0f / tq->lmax;
+    if (tq->K <= 16)
+        for (int k = 0; k < tq->K; k++) {
+            int v = (int)lrintf(tq->levels[k] * tq->s8x);
+            tq->l8[k] = (int8_t)(v > 127 ? 127 : v < -127 ? -127 : v);
+        }
 
     uint64_t s = seed ? seed : 0x9E3779B97F4A7C15ULL;
     tq->signs = malloc((size_t)TQ_ROUNDS * tq->pdim * sizeof(float));
@@ -342,12 +348,54 @@ static int32_t tq_doti8_vnni(const uint8_t *qu8, const int8_t *x, int pdim)
 #define TQ_HAVE_VNNI 1
 #endif
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+#include <arm_neon.h>
+/* Both bit-widths scan as signed-int8 dots via SDOT (4 MACs/lane,
+ * 16 codes per instruction). No zero-point correction needed: SDOT is
+ * signed x signed, unlike AVX512-VNNI's unsigned x signed dpbusd.
+ * 4-bit decode: nibbles -> vqtbl1q over the 16-entry int8 codebook,
+ * which fits exactly in one table register.                            */
+static int32_t tq_dot4_neon(const int8_t *qi8, const uint8_t *code, int pdim,
+                            const int8_t *l8)
+{
+    const int8x16_t tbl = vld1q_s8(l8);
+    const uint8x8_t nib = vdup_n_u8(0x0F);
+    int32x4_t acc = vdupq_n_s32(0);
+    for (int i = 0; i < pdim; i += 16) {
+        uint8x8_t raw = vld1_u8(code + (i >> 1));        /* 8 bytes = 16 codes */
+        uint8x8_t lo = vand_u8(raw, nib);                /* even coords */
+        uint8x8_t hi = vshr_n_u8(raw, 4);                /* odd coords  */
+        uint8x8x2_t z = vzip_u8(lo, hi);                 /* interleave  */
+        uint8x16_t idx = vcombine_u8(z.val[0], z.val[1]);
+        int8x16_t vals = vqtbl1q_s8(tbl, idx);
+        acc = vdotq_s32(acc, vals, vld1q_s8(qi8 + i));
+    }
+    return vaddvq_s32(acc);
+}
+
+static int32_t tq_dot8_neon(const int8_t *qi8, const int8_t *x, int pdim)
+{
+    int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+    int i = 0;
+    for (; i + 32 <= pdim; i += 32) {
+        a0 = vdotq_s32(a0, vld1q_s8(x + i),      vld1q_s8(qi8 + i));
+        a1 = vdotq_s32(a1, vld1q_s8(x + i + 16), vld1q_s8(qi8 + i + 16));
+    }
+    for (; i + 16 <= pdim; i += 16)
+        a0 = vdotq_s32(a0, vld1q_s8(x + i), vld1q_s8(qi8 + i));
+    return vaddvq_s32(vaddq_s32(a0, a1));
+}
+#define TQ_NEON_DOT 1
+#endif
+
+#if !defined(TQ_NEON_DOT)
 static int32_t tq_doti8_scalar(const uint8_t *qu8, const int8_t *x, int pdim)
 {
     int32_t s = 0;
     for (int i = 0; i < pdim; i++) s += (int32_t)qu8[i] * (int32_t)x[i];
     return s;
 }
+#endif
 
 /* plain float dot with AVX-512 + masked tail (QJL matvecs) */
 #ifdef TQ_HAVE_SIMD
@@ -443,13 +491,20 @@ int tq_search(const TQIndex *tq_c, const float *query, int k, VecResult *out)
     const int simd = (tq->pdim % 16) == 0;
 #endif
 
-    /* int8 query prep for the bits==8 VNNI scan: quantize qr once,
-     * offset to unsigned for vpdpbusd, undo scales after the int dot. */
-    uint8_t *qu8 = NULL;
+    /* int8 query prep: quantize qr once per query. NEON+SDOT scans both
+     * bit-widths as signed int8 (4-bit decodes via tbl); x86 keeps the
+     * float permutexvar path for 4-bit and uses VNNI (unsigned+bias) or
+     * scalar for 8-bit. */
+    uint8_t *qu8 = NULL;          /* unsigned + 128 offset (VNNI/scalar) */
+    int8_t  *qi8 = NULL;          /* signed (NEON SDOT)                  */
     float i8_inv_scale = 0.f;     /* 1 / (s8q * s8x) */
-    int32_t q_zero_bias = 0;      /* 128 multiplies sum(x_i8) per vector */
     int use_i8 = 0;
-    if (tq->bits == 8) {
+#if defined(TQ_NEON_DOT)
+    int want_i8 = (tq->pdim % 16) == 0;            /* 4-bit and 8-bit */
+#else
+    int want_i8 = (tq->bits == 8);
+#endif
+    if (want_i8) {
         float qmax = 0.f;
         for (int i = 0; i < tq->pdim; i++) {
             float a = fabsf(qr[i]);
@@ -457,15 +512,19 @@ int tq_search(const TQIndex *tq_c, const float *query, int k, VecResult *out)
         }
         if (qmax > 0.f) {
             float s8q = 127.0f / qmax;
-            qu8 = malloc(tq->pdim);
+            qi8 = malloc(tq->pdim);
             for (int i = 0; i < tq->pdim; i++) {
                 int q = (int)lrintf(qr[i] * s8q);
                 if (q >  127) q =  127;
                 if (q < -127) q = -127;
-                qu8[i] = (uint8_t)(q + 128);
+                qi8[i] = (int8_t)q;
             }
+#if !defined(TQ_NEON_DOT)
+            qu8 = malloc(tq->pdim);
+            for (int i = 0; i < tq->pdim; i++)
+                qu8[i] = (uint8_t)((int)qi8[i] + 128);
+#endif
             i8_inv_scale = 1.0f / (s8q * tq->s8x);
-            q_zero_bias = 128;
             use_i8 = 1;
         }
     }
@@ -480,6 +539,12 @@ int tq_search(const TQIndex *tq_c, const float *query, int k, VecResult *out)
         const uint8_t *code = tq->codes + v * tq->code_bytes;
         float dot;
         if (use_i8) {
+#if defined(TQ_NEON_DOT)
+            int32_t di = (tq->bits == 4)
+                ? tq_dot4_neon(qi8, code, tq->pdim, tq->l8)
+                : tq_dot8_neon(qi8, (const int8_t *)code, tq->pdim);
+            dot = (float)di * i8_inv_scale;     /* signed x signed: no bias */
+#else
             int32_t di;
 #ifdef TQ_HAVE_VNNI
             if ((tq->pdim % 64) == 0)
@@ -487,7 +552,8 @@ int tq_search(const TQIndex *tq_c, const float *query, int k, VecResult *out)
             else
 #endif
                 di = tq_doti8_scalar(qu8, (const int8_t *)code, tq->pdim);
-            dot = (float)(di - q_zero_bias * tq->i8sums[v]) * i8_inv_scale;
+            dot = (float)(di - 128 * tq->i8sums[v]) * i8_inv_scale;
+#endif
         }
 #ifdef TQ_HAVE_SIMD
         else if (simd && tq->bits == 4)
@@ -556,6 +622,22 @@ int tq_search(const TQIndex *tq_c, const float *query, int k, VecResult *out)
             j = m;
         }
     }
-    free(qr); free(Sq); free(qu8); free(hd); free(hi);
+    free(qr); free(Sq); free(qu8); free(qi8); free(hd); free(hi);
     return hn;
+}
+
+/* Batched scan, parallel over queries when built with OpenMP.
+ * tq_search allocates all per-query scratch locally, so concurrent
+ * searches share no mutable state. */
+int tq_search_batch(const TQIndex *tq, const float *queries, int nq, int k,
+                    VecResult *out)
+{
+    if (!tq || nq <= 0 || k <= 0) return 0;
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int i = 0; i < nq; i++) {
+        VecResult *o = out + (size_t)i * k;
+        int n = tq_search(tq, queries + (size_t)i * tq->dim, k, o);
+        for (int j = n; j < k; j++) { o[j].id = (uint64_t)-1; o[j].dist = INFINITY; }
+    }
+    return k;
 }
