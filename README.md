@@ -16,9 +16,14 @@ builds via seeded xorshift RNG.
 
 ~11x speedup over exact search at 99.9% recall.
 
-## Build & run
+## Quick start
 
-
+```sh
+# Build the library
+make
+# Run a simple benchmark (generates an index and queries it)
+./bench 50000 128
+```
 
 ## Usage
 
@@ -75,10 +80,6 @@ vecdb_save(db, "index.vecdb");
 
 
 ## API
-
-
-
-
 ## API
 
 ```c
