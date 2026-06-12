@@ -20,7 +20,7 @@ int main(int argc, char **argv) {
         for (size_t d = 0; d < dim; d++) {
             vec[d] = (float)rand() / RAND_MAX;
         }
-        vecdb_add(db, (int)i, vec);
+        vecdb_add(db, (uint64_t)i, vec);
         free(vec);
     }
 
@@ -31,7 +31,7 @@ int main(int argc, char **argv) {
     }
     VecResult out[10];
     vecdb_search_hnsw(db, q, 10, 100, out);
-    printf("Top result id: %llu distance: %f\n", out[0].id, out[0].dist);
+    printf("Top result id: %llu distance: %f\n", (unsigned long long)out[0].id, out[0].dist);
     free(q);
     vecdb_save(db, "index.vecdb");
     vecdb_free(db);

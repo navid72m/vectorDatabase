@@ -59,6 +59,8 @@ _lib.vecdb_load.restype = c_void_p
 # Delete support
 _lib.vecdb_delete.argtypes = [c_void_p, c_uint64]
 _lib.vecdb_delete.restype = c_int
+_lib.vecdb_compact.argtypes = [c_void_p]
+_lib.vecdb_compact.restype = c_int
 
 
 def _as_f32_matrix(x: np.ndarray, dim: int) -> np.ndarray:
@@ -122,11 +124,17 @@ class VecDB:
         Calls the underlying C ``vecdb_delete`` for each ID. If any deletion fails
         (e.g., the ID is not present) a ``RuntimeError`` is raised.
         """
-        ids = np.ascontiguousarray(ids, dtype=np.uint64)
+        ids = np.ascontiguousarray(np.atleast_1d(ids), dtype=np.uint64)
         for i in range(ids.shape[0]):
             rc = _lib.vecdb_delete(self._h, int(ids[i]))
             if rc != 0:
                 raise RuntimeError(f"vecdb_delete failed for id {ids[i]}")
+
+    def compact(self) -> None:
+        """Rebuild the index without tombstoned nodes. Restores graph
+        quality and reclaims memory after many deletes."""
+        if _lib.vecdb_compact(self._h) != 0:
+            raise RuntimeError("vecdb_compact failed")
 
 
     # -- reads ---------------------------------------------------------

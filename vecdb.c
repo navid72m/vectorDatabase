@@ -142,10 +142,90 @@ struct VecDB {
     int64_t    entry;            /* entry point node, -1 if empty     */
     int        max_level;
 
+    /* tombstone deletes: dead nodes keep carrying graph connectivity
+     * (traversal passes through them) but are filtered from results.   */
+    uint8_t  *dead;              /* cap bytes, 1 = tombstoned          */
+    size_t    alive;             /* live vector count                  */
+
+    /* id -> slot open-addressing hash map (O(1) delete/lookup)        */
+    uint64_t *map_keys;
+    uint32_t *map_vals;
+    uint8_t  *map_state;         /* 0 empty, 1 used, 2 erased          */
+    size_t    map_cap;           /* power of two                       */
+    size_t    map_used;
+
     /* per-query visited marks (epoch trick, no memset per query)     */
     uint32_t *visited;
     uint32_t  epoch;
 };
+
+/* splitmix64 finalizer */
+static uint64_t hash_u64(uint64_t x)
+{
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+static void map_put(VecDB *db, uint64_t key, uint32_t val);
+
+static void map_rehash(VecDB *db, size_t ncap)
+{
+    uint64_t *ok = db->map_keys; uint32_t *ov = db->map_vals;
+    uint8_t *os = db->map_state; size_t oc = db->map_cap;
+    db->map_keys  = malloc(ncap * sizeof(uint64_t));
+    db->map_vals  = malloc(ncap * sizeof(uint32_t));
+    db->map_state = calloc(ncap, 1);
+    db->map_cap = ncap; db->map_used = 0;
+    for (size_t i = 0; i < oc; i++)
+        if (os[i] == 1) map_put(db, ok[i], ov[i]);
+    free(ok); free(ov); free(os);
+}
+
+static void map_put(VecDB *db, uint64_t key, uint32_t val)
+{
+    if ((db->map_used + 1) * 10 >= db->map_cap * 7)       /* <70% load */
+        map_rehash(db, db->map_cap ? db->map_cap * 2 : 2048);
+    size_t m = db->map_cap - 1, i = hash_u64(key) & m;
+    size_t grave = (size_t)-1;
+    for (;;) {
+        if (db->map_state[i] == 0) break;
+        if (db->map_state[i] == 2) { if (grave == (size_t)-1) grave = i; }
+        else if (db->map_keys[i] == key) { db->map_vals[i] = val; return; }
+        i = (i + 1) & m;
+    }
+    if (grave != (size_t)-1) i = grave;
+    db->map_keys[i] = key; db->map_vals[i] = val; db->map_state[i] = 1;
+    db->map_used++;
+}
+
+/* returns slot or UINT32_MAX */
+static uint32_t map_get(const VecDB *db, uint64_t key)
+{
+    if (!db->map_cap) return UINT32_MAX;
+    size_t m = db->map_cap - 1, i = hash_u64(key) & m;
+    for (;;) {
+        if (db->map_state[i] == 0) return UINT32_MAX;
+        if (db->map_state[i] == 1 && db->map_keys[i] == key) return db->map_vals[i];
+        i = (i + 1) & m;
+    }
+}
+
+static void map_del(VecDB *db, uint64_t key)
+{
+    if (!db->map_cap) return;
+    size_t m = db->map_cap - 1, i = hash_u64(key) & m;
+    for (;;) {
+        if (db->map_state[i] == 0) return;
+        if (db->map_state[i] == 1 && db->map_keys[i] == key) {
+            db->map_state[i] = 2;
+            db->map_used--;
+            return;
+        }
+        i = (i + 1) & m;
+    }
+}
 
 static const float *vec_at(const VecDB *db, uint32_t i) { return db->vecs + (size_t)i * db->dim; }
 
@@ -201,6 +281,7 @@ VecDB *vecdb_create(const VecDBConfig *cfg)
     db->l0      = malloc(db->cap * db->l0_stride * sizeof(uint32_t));
     db->upper   = calloc(db->cap, sizeof(uint32_t *));
     db->node_level = calloc(db->cap, 1);
+    db->dead    = calloc(db->cap, 1);
     db->visited = calloc(db->cap, sizeof(uint32_t));
     db->entry = -1;
     db->max_level = -1;
@@ -212,12 +293,13 @@ void vecdb_free(VecDB *db)
 {
     if (!db) return;
     for (size_t i = 0; i < db->count; i++) free(db->upper[i]);
-    free(db->upper); free(db->node_level); free(db->l0);
+    free(db->upper); free(db->node_level); free(db->l0); free(db->dead);
+    free(db->map_keys); free(db->map_vals); free(db->map_state);
     free(db->vecs); free(db->vnorms); free(db->ids); free(db->visited);
     free(db);
 }
 
-size_t vecdb_count(const VecDB *db) { return db->count; }
+size_t vecdb_count(const VecDB *db) { return db->alive; }
 int    vecdb_dim(const VecDB *db)   { return db->dim; }
 
 static void grow(VecDB *db)
@@ -229,9 +311,11 @@ static void grow(VecDB *db)
     db->l0      = realloc(db->l0,     ncap * db->l0_stride * sizeof(uint32_t));
     db->upper   = realloc(db->upper,  ncap * sizeof(uint32_t *));
     db->node_level = realloc(db->node_level, ncap);
+    db->dead    = realloc(db->dead, ncap);
     db->visited = realloc(db->visited, ncap * sizeof(uint32_t));
     memset(db->upper + db->cap, 0, (ncap - db->cap) * sizeof(uint32_t *));
     memset(db->node_level + db->cap, 0, ncap - db->cap);
+    memset(db->dead + db->cap, 0, ncap - db->cap);
     memset(db->visited + db->cap, 0, (ncap - db->cap) * sizeof(uint32_t));
     db->cap = ncap;
 }
@@ -240,7 +324,7 @@ static int link_cap(const VecDB *db, int level) { return level == 0 ? db->M0 : d
 
 /* Greedy beam search on one layer. Results land in `res` (max-heap, size<=ef). */
 static void search_layer(VecDB *db, const float *q, uint32_t entry, int ef,
-                         int level, Heap *res)
+                         int level, Heap *res, int filter_dead)
 {
     db->epoch++;
     if (db->epoch == 0) {            /* wrapped: clear marks once */
@@ -253,7 +337,7 @@ static void search_layer(VecDB *db, const float *q, uint32_t entry, int ef,
     float d0 = l2sq(q, vec_at(db, entry), db->dim);
     db->visited[entry] = db->epoch;
     heap_push(&cand, d0, entry);
-    heap_push(res, d0, entry);
+    if (!filter_dead || !db->dead[entry]) heap_push(res, d0, entry);
 
     while (cand.n > 0) {
         HItem c = heap_pop(&cand);
@@ -278,8 +362,10 @@ static void search_layer(VecDB *db, const float *q, uint32_t entry, int ef,
             float d = l2sq(q, vec_at(db, nb), db->dim);
             if (res->n < ef || d < res->a[0].dist) {
                 heap_push(&cand, d, nb);
-                heap_push(res, d, nb);
-                if (res->n > ef) heap_pop(res);
+                if (!filter_dead || !db->dead[nb]) {
+                    heap_push(res, d, nb);
+                    if (res->n > ef) heap_pop(res);
+                }
             }
         }
     }
@@ -358,7 +444,12 @@ int64_t vecdb_add(VecDB *db, uint64_t id, const float *vec)
     if (!db || !vec) return -1;
     if (db->count == db->cap) grow(db);
 
+    if (map_get(db, id) != UINT32_MAX) return -1;   /* duplicate live id */
+
     uint32_t idx = (uint32_t)db->count++;
+    db->dead[idx] = 0;
+    db->alive++;
+    map_put(db, id, idx);
     memcpy(db->vecs + (size_t)idx * db->dim, vec, (size_t)db->dim * sizeof(float));
     db->ids[idx] = id;
     {
@@ -392,7 +483,7 @@ int64_t vecdb_add(VecDB *db, uint64_t id, const float *vec)
     int start = level < db->max_level ? level : db->max_level;
     for (int l = start; l >= 0; l--) {
         Heap res; heap_init(&res, db->ef_construction + 1, 1);
-        search_layer(db, vec, ep, db->ef_construction, l, &res);
+        search_layer(db, vec, ep, db->ef_construction, l, &res, 0);
 
         int M = db->M;  /* links to create from the new node */
         uint32_t *sel = malloc((size_t)M * sizeof(uint32_t));
@@ -427,61 +518,47 @@ int64_t vecdb_add(VecDB *db, uint64_t id, const float *vec)
 }
 
 /* ------------------------------------------------------------------ */
-/* Delete                                                               */
+/* Delete (tombstones)                                                 */
+/* A deleted node stays in the graph as a waypoint: traversal passes   */
+/* through it (removing it would orphan regions it connects), but it   */
+/* is excluded from results, scans, and persistence-rebuilt maps.      */
+/* Slots are not reused; call vecdb_compact() to rebuild without the   */
+/* dead nodes once they accumulate.                                    */
 /* ------------------------------------------------------------------ */
-int vecdb_delete(VecDB *db, uint64_t id) {
+int vecdb_delete(VecDB *db, uint64_t id)
+{
     if (!db) return -1;
-    /* locate internal index */
-    uint32_t idx = UINT32_MAX;
+    uint32_t idx = map_get(db, id);
+    if (idx == UINT32_MAX) return -1;
+    db->dead[idx] = 1;
+    db->alive--;
+    map_del(db, id);
+    return 0;
+}
+
+int vecdb_compact(VecDB *db)
+{
+    if (!db) return -1;
+    if (db->alive == db->count) return 0;            /* nothing to do */
+    VecDBConfig cfg;
+    cfg.dim = db->dim; cfg.M = db->M;
+    cfg.ef_construction = db->ef_construction;
+    cfg.initial_capacity = db->alive ? db->alive : 1024;
+    cfg.seed = db->rng;                              /* continue RNG stream */
+    VecDB *nd = vecdb_create(&cfg);
+    if (!nd) return -1;
     for (size_t i = 0; i < db->count; i++) {
-        if (db->ids[i] == id) { idx = (uint32_t)i; break; }
-    }
-    if (idx == UINT32_MAX) return -1; /* not found */
-
-    /* swap with last element to keep storage dense */
-    uint32_t last = (uint32_t)(db->count - 1);
-    if (idx != last) {
-        /* copy vector data */
-        memcpy(db->vecs + (size_t)idx * db->dim,
-               db->vecs + (size_t)last * db->dim,
-               (size_t)db->dim * sizeof(float));
-        db->vnorms[idx] = db->vnorms[last];
-        db->ids[idx] = db->ids[last];
-        db->node_level[idx] = db->node_level[last];
-        /* copy level‑0 links */
-        uint32_t *L_src = node_links(db, last, 0);
-        uint32_t *L_dst = node_links(db, idx, 0);
-        memcpy(L_dst, L_src, db->l0_stride * sizeof(uint32_t));
-        /* copy upper links if any */
-        if (db->upper[last]) {
-            if (!db->upper[idx])
-                db->upper[idx] = calloc((size_t)db->node_level[idx] * (size_t)(db->M + 2), sizeof(uint32_t));
-            memcpy(db->upper[idx], db->upper[last],
-                   (size_t)db->node_level[last] * (size_t)(db->M + 2) * sizeof(uint32_t));
-        } else {
-            if (db->upper[idx]) { free(db->upper[idx]); db->upper[idx] = NULL; }
+        if (db->dead[i]) continue;
+        if (vecdb_add(nd, db->ids[i], vec_at(db, (uint32_t)i)) < 0) {
+            vecdb_free(nd);
+            return -1;
         }
-        free(db->upper[last]);
-        db->upper[last] = NULL;
     }
-    /* free links of the removed node */
-    free(db->upper[last]);
-    db->upper[last] = NULL;
-
-    /* decrement count */
-    db->count--;
-
-    /* fix entry point if it pointed to moved node */
-    if (db->entry == (int64_t)last) db->entry = (int64_t)idx;
-    else if (db->entry == (int64_t)idx) db->entry = (int64_t)idx; // unchanged
-
-    /* recompute max_level if needed */
-    if ((int)idx == db->max_level) {
-        int new_max = 0;
-        for (size_t i = 0; i < db->count; i++)
-            if ((int)db->node_level[i] > new_max) new_max = db->node_level[i];
-        db->max_level = new_max;
-    }
+    /* swap guts, free the old body */
+    VecDB tmp = *db;
+    *db = *nd;
+    *nd = tmp;
+    vecdb_free(nd);
     return 0;
 }
 
@@ -546,8 +623,8 @@ static void dots_block(const float *x, const float *const *qrows, int qb,
 int vecdb_search_flat_batch(const VecDB *db, const float *queries, int nq,
                             int k, VecResult *out)
 {
-    if (!db || db->count == 0 || k <= 0 || nq <= 0) return 0;
-    int kk = (size_t)k > db->count ? (int)db->count : k;
+    if (!db || db->alive == 0 || k <= 0 || nq <= 0) return 0;
+    int kk = (size_t)k > db->alive ? (int)db->alive : k;
 
     for (int q0 = 0; q0 < nq; q0 += FLAT_QB) {
         int qb = nq - q0 < FLAT_QB ? nq - q0 : FLAT_QB;
@@ -563,6 +640,7 @@ int vecdb_search_flat_batch(const VecDB *db, const float *queries, int nq,
         }
 
         for (size_t v = 0; v < db->count; v++) {
+            if (db->dead[v]) continue;
             dots_block(vec_at(db, (uint32_t)v), qrows, qb, db->dim, dots);
             float xn = db->vnorms[v];
             for (int j = 0; j < qb; j++) {
@@ -591,7 +669,7 @@ int vecdb_search_flat_batch(const VecDB *db, const float *queries, int nq,
 int vecdb_search_hnsw(const VecDB *db_const, const float *query, int k, int ef, VecResult *out)
 {
     VecDB *db = (VecDB *)db_const;   /* mutates visited/epoch only */
-    if (!db || db->count == 0 || k <= 0) return 0;
+    if (!db || db->alive == 0 || k <= 0) return 0;
     if (ef < k) ef = k;
 
     uint32_t ep = (uint32_t)db->entry;
@@ -599,7 +677,7 @@ int vecdb_search_hnsw(const VecDB *db_const, const float *query, int k, int ef, 
         ep = greedy_step(db, query, ep, l);
 
     Heap res; heap_init(&res, ef + 1, 1);
-    search_layer(db, query, ep, ef, 0, &res);
+    search_layer(db, query, ep, ef, 0, &res, 1);
     int n; emit_topk(db, &res, k, out, &n);
     heap_destroy(&res);
     return n;
@@ -615,7 +693,7 @@ int vecdb_save(const VecDB *db, const char *path)
 {
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
-    uint32_t magic = VECDB_MAGIC, version = 1;
+    uint32_t magic = VECDB_MAGIC, version = 2;
     int64_t entry = db->entry;
     fwrite(&magic, 4, 1, f); fwrite(&version, 4, 1, f);
     fwrite(&db->dim, 4, 1, f); fwrite(&db->M, 4, 1, f);
@@ -633,6 +711,7 @@ int vecdb_save(const VecDB *db, const char *path)
             fwrite(&L[1], 4, n, f);
         }
     }
+    fwrite(db->dead, 1, db->count, f);               /* v2: tombstones */
     fclose(f);
     return 0;
 }
@@ -650,6 +729,7 @@ VecDB *vecdb_load(const char *path)
     RD(&magic, 4, 1);
     if (magic != VECDB_MAGIC) goto fail;
     RD(&version, 4, 1);
+    if (version < 1 || version > 2) goto fail;
     RD(&dim, 4, 1); RD(&M, 4, 1);
     RD(&efc, 4, 1); RD(&max_level, 4, 1);
     RD(&entry, 8, 1); RD(&count, 8, 1);
@@ -681,7 +761,16 @@ VecDB *vecdb_load(const char *path)
             uint32_t *L = node_links(db, (uint32_t)i, l);
             L[0] = n;
             RD(&L[1], 4, n);
+            for (uint32_t j = 1; j <= n; j++)        /* validate link range */
+                if (L[j] >= count) goto fail;
         }
+    }
+    if (version >= 2) RD(db->dead, 1, count);
+    db->alive = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (db->dead[i]) continue;
+        db->alive++;
+        map_put(db, db->ids[i], (uint32_t)i);
     }
     fclose(f);
     return db;

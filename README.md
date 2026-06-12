@@ -8,7 +8,7 @@
 - **Blocked exact batch search** — processes up to 8 queries per pass so one vector load feeds multiple query accumulators.
 - **HNSW approximate search** — graph index using greedy descent, beam search (`ef`), and heuristic neighbor selection.
 - **Binary persistence** — save/load an index with vectors, IDs, levels, and neighbor links.
-- **Delete API** — delete vectors by user ID. Deletion is linear-time and keeps storage dense by swapping with the last vector.
+- **Delete API** — O(1) tombstone deletes by user ID, with stable recall under churn and a `compact()` rebuild to reclaim space.
 - **TurboQuant compressed index** — optional 4-bit or 8-bit compressed brute-force index with randomized Hadamard rotation, norm separation, Lloyd-Max Gaussian quantization, and optional QJL residual estimation.
 
 The C API is declared in `vecdb.h`. The Python API lives in `pyvecdb.py` and loads `libvecdb.so` from the project directory by default.
@@ -106,7 +106,8 @@ Core methods:
 
 ```python
 db.add(vectors, ids=None)          # returns None; ids default to current_count..current_count+n
-db.delete(ids)                     # raises RuntimeError if any id is missing
+db.delete(ids)                     # O(1) per id; raises RuntimeError if any id is missing
+db.compact()                       # rebuild without tombstones after many deletes
 ids, distances = db.search(queries, k=10, ef=100, exact=False)
 db.save(path)
 loaded = VecDB.load(path)
@@ -145,7 +146,14 @@ db.save("index.vecdb")
 loaded = VecDB.load("index.vecdb")
 ```
 
-Delete caveat: `VecDB.delete()` is O(N) per ID and keeps storage dense by swapping the removed vector with the last vector. External references to internal node positions become invalid after deletion. After many deletes, rebuilding the index can improve HNSW graph quality.
+Delete semantics: `VecDB.delete()` is O(1) per ID via an internal id->slot
+hash map. Deleted nodes are tombstoned: they keep carrying HNSW graph
+connectivity (traversal passes through them, so deleting hub nodes cannot
+orphan graph regions) but are excluded from all search results, exact scans,
+and counts. Tombstoned slots are not reused; after heavy churn, call
+`db.compact()` to rebuild the index without them. In a 5-cycle churn test
+(30% turnover per cycle, 10k vectors), recall@10 stayed in 0.95-0.97 with
+no degradation trend. Adding a duplicate live ID is rejected with an error.
 
 ### `TQIndex`
 
@@ -220,6 +228,7 @@ Return semantics:
 - `vecdb_create()` returns `NULL` on invalid config or allocation failure.
 - `vecdb_add()` returns the internal index on success, or `-1` on failure.
 - `vecdb_delete()` returns `0` on success, or `-1` if the ID is not found.
+- `vecdb_compact()` returns `0` on success, `-1` on allocation failure.
 - `vecdb_search_*()` returns the number of results written.
 - `vecdb_save()` returns `0` on success, or `-1` on failure.
 - `vecdb_load()` returns `NULL` on open/read/format failure.
@@ -268,7 +277,8 @@ Core C functions:
 | `vecdb_create(&cfg)` | Allocate and initialize a database |
 | `vecdb_free(db)` | Free all memory |
 | `vecdb_add(db, id, vector)` | Insert one vector |
-| `vecdb_delete(db, id)` | Delete one vector by user ID |
+| `vecdb_delete(db, id)` | O(1) tombstone delete by user ID |
+| `vecdb_compact(db)` | Rebuild in place without tombstoned nodes |
 | `vecdb_count(db)` | Number of stored vectors |
 | `vecdb_dim(db)` | Vector dimensionality |
 | `vecdb_search_flat(db, query, k, out)` | Exact single-query search |
@@ -306,11 +316,11 @@ Distances returned by `TQIndex.search()` are estimated squared L2 distances for 
 ## Known limits
 
 - Single-threaded indexing and search.
-- HNSW deletion removes the node by swap-with-last instead of repairing the graph. Rebuild after many deletes if graph quality matters.
-- Python `VecDB.delete()` is O(N) per ID and invalidates external assumptions about internal node order.
+- Tombstoned slots are not reused by inserts; memory is reclaimed only by `compact()`. Long-running high-churn workloads should compact periodically.
+- `compact()` rebuilds the whole graph (O(N log N) inserts), so it is a maintenance operation, not a per-delete cost.
 - TurboQuant is a brute-force compressed index; it does not build an HNSW graph.
 - TurboQuant has no delete or save/load API yet.
-- Persistence format is versioned but not a long-term stable external format.
+- Persistence format is versioned (v2 adds tombstones; v1 files still load) but not a long-term stable external format.
 
 ## Project layout
 
@@ -322,7 +332,29 @@ pyvecdb.py     # ctypes Python bindings
 bench.c        # small random-data smoke/demo program
 Makefile       # build rules for libvecdb.so and bench
 pyproject.toml # Python package metadata
+tests.py       # correctness + churn test suite (python tests.py)
+benchmarks/    # FAISS/Chroma/Qdrant comparison + quantization shoot-out
 ```
+
+## Measured results
+
+All single-threaded, 20k x 128 Gaussian-mixture vectors, recall verified
+against exact ground truth (see `benchmarks/` for the scripts):
+
+| index                      | QPS    | recall@10 | note                          |
+|----------------------------|--------|-----------|-------------------------------|
+| flat exact (8-query block) |  3,928 | 1.000     | 1.9x faster than faiss flat   |
+| HNSW ef=50                 | 16,578 | 1.000     | 79% of faiss HNSW             |
+| HNSW ef=200                |  8,574 | 1.000     | 91% of faiss HNSW             |
+| TurboQuant 4-bit           |  2,235 | 0.622     | beats faiss SQ4; 1.000 w/ rerank |
+| TurboQuant 8-bit (VNNI)    |  4,993 | 0.937     | 2.5x faiss SQ8; 1.000 w/ rerank |
+
+Churn stability: 5 cycles of 30% delete+reinsert on 10k vectors held
+recall@10 at 0.95-0.97; `compact()` rebuilt 10k vectors in ~1.6s.
+
+Caveats: one machine (AVX-512 + VNNI), synthetic clustered data, single
+thread; the Qdrant comparison in `benchmarks/benchmark.py` uses
+qdrant-client's in-process mode, not a server.
 
 ## License
 
