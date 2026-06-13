@@ -1,6 +1,7 @@
 # vecdb — a small vector database in C
 
 ![CI](https://github.com/navid72m/vectorDatabase/actions/workflows/ci.yml/badge.svg)
+[![PyPI](https://img.shields.io/pypi/v/vecdbc.svg)](https://pypi.org/project/vecdbc/)
 
 `vecdb` is a dependency-light vector index implemented in C11 with Python bindings through `ctypes`. It stores fixed-size `float32` vectors and supports exact and approximate nearest-neighbor search using squared L2 distance.
 
@@ -20,6 +21,30 @@
 - **TurboQuant compressed index** — optional 4-bit or 8-bit compressed brute-force index with randomized Hadamard rotation, norm separation, Lloyd-Max Gaussian quantization, and optional QJL residual estimation.
 
 The C API is declared in `vecdb.h`. The Python API lives in `pyvecdb.py` and loads `libvecdb.so` from the project directory by default.
+
+## Install
+
+```sh
+pip install vecdbc
+```
+
+The package compiles the C core on install (portable SIMD flags — AVX2 on
+x86, NEON on Apple Silicon; set `VECDB_AVX512=1` to build the AVX-512 kernels
+for a target that supports them). A C compiler is required; OpenMP is used
+when available and falls back to serial otherwise. The import name is
+`pyvecdb`:
+
+```python
+import numpy as np
+from pyvecdb import VecDB
+
+db = VecDB(dim=128)
+db.add(np.random.rand(10_000, 128).astype(np.float32))
+ids, dists = db.search(np.random.rand(5, 128).astype(np.float32), k=10)
+```
+
+(The distribution name is `vecdbc` because `vecdb` was taken on PyPI; the
+module you import is still `pyvecdb`.)
 
 ## Build from source
 
