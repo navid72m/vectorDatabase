@@ -1,25 +1,29 @@
 [project]
-name = "vecdb"
+name = "vecdbc"
 version = "0.1.0"
-description = "A lightweight vector database in C with Python bindings."
+description = "A from-scratch vector database in C (HNSW + TurboQuant + hybrid) with Python bindings"
 readme = "README.md"
 requires-python = ">=3.8"
 authors = [{name = "Seyed Navid Mirnour algeri", email = "navid72m@gmail.com"}]
 license = {text = "MIT"}
+dependencies = ["numpy"]
+keywords = ["vector-database", "ann", "nearest-neighbor", "hnsw", "quantization", "embeddings"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Database :: Database Engines/Servers",
 ]
 
+[project.urls]
+Homepage = "https://github.com/navid72m/vectorDatabase"
+Repository = "https://github.com/navid72m/vectorDatabase"
+
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
+# Flat layout: pyvecdb.py is a top-level module; the C sources are compiled
+# into libvecdb.so by setup.py's custom build step and shipped beside it.
 [tool.setuptools]
-package-dir = {"" = ""}
-packages = ["."]
-include-package-data = true
-
-[tool.setuptools.package-data]
-"" = ["libvecdb.so"]
+py-modules = ["pyvecdb"]

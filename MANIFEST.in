@@ -1,0 +1,3 @@
+include vecdb.c turboquant.c hybrid.c
+include vecdb.h turboquant.h hybrid.h
+include README.md LICENSE
