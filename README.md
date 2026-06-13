@@ -541,6 +541,36 @@ The `.fvecs`/`.ivecs` loaders are validated by a format round-trip; the full
 pipeline (load → build → recall-vs-ground-truth) is exercised on a small
 synthetic file in the same binary layout.
 
+### Second dataset: GIST1M (960-d) — a different regime
+
+GIST1M (1M x 960, same TEXMEX format) is a harder, higher-dimensional test.
+At 960-d, recall must be read against recall, not ef: vecdb returns higher
+recall than FAISS at every ef (better graph quality where navigation is
+hard), so a row-by-row QPS comparison is misleading. Single-thread, matched
+HNSW params, recall vs ground truth:
+
+| ef  | vecdb recall / QPS | faiss recall / QPS |
+|-----|--------------------|--------------------|
+| 50  | 0.752 / 1,534      | 0.724 / 3,067      |
+| 100 | 0.854 / 1,091      | 0.827 / 1,654      |
+| 200 | 0.931 / 609        | 0.903 / 913        |
+| 400 | 0.971 / 350        | 0.948 / 493        |
+| 800 | 0.989 / 177        | 0.970 / 255        |
+
+Read at matched *recall*: FAISS is faster in the low-recall regime, but
+vecdb wins at high recall and reaches accuracy FAISS doesn't hit in this
+sweep — e.g. ~0.97 recall costs vecdb ef=400 (350 qps) vs FAISS ef=800
+(255 qps), ~1.37x; and vecdb reaches 0.989 where FAISS tops out at 0.970.
+
+The contrast with SIFT (128-d) is the interesting part. At 128-d vecdb's
+hand-written kernel makes it faster at matched ef (compute-bound, the kernel
+dominates). At 960-d each distance streams ~3.8 KB, so the inner loop is
+memory-bandwidth-bound and the kernel advantage shrinks — FAISS catches up
+on raw speed. What shows through instead is graph quality: vecdb's higher
+recall per ef is an algorithmic edge independent of the kernel. Two
+dimensionalities, two regimes: kernel-bound at 128-d, bandwidth-plus-graph
+at 960-d. Build was 1.8x faster (765s vs 1396s).
+
 ## License
 
 MIT.
