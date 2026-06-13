@@ -1,9 +1,11 @@
-# vecdb — a small vector database in C
+# vecdb — a vector search engine in C (HNSW + SIMD)
 
 ![CI](https://github.com/navid72m/vectorDatabase/actions/workflows/ci.yml/badge.svg)
 [![PyPI](https://img.shields.io/pypi/v/vecdbc.svg)](https://pypi.org/project/vecdbc/)
 
-`vecdb` is a dependency-light vector index implemented in C11 with Python bindings through `ctypes`. It stores fixed-size `float32` vectors and supports exact and approximate nearest-neighbor search using squared L2 distance.
+`vecdb` is a dependency-light vector search engine implemented in C11 with Python bindings through `ctypes` — the same category as FAISS, hnswlib, and Annoy: an embedded similarity-search index, not a full database server. It stores fixed-size `float32` vectors and supports exact and approximate nearest-neighbor search using squared L2 distance, with hand-written SIMD kernels (AVX-512 on x86, NEON on ARM), training-free quantization, and a hybrid quantized-graph index.
+
+It is a search *engine*, not a vector *database* in the Qdrant/Weaviate/Milvus sense: there is no transaction log, no network/query server, no sharding or replication, and no schema/payload management. Those systems are typically built *on top of* an index like this one (Milvus, for instance, wraps FAISS/hnswlib). What vecdb provides is the index layer — fast search, CRUD on vectors, metadata filtering, persistence, and concurrency — done from scratch and benchmarked head-to-head against FAISS on SIFT1M and GIST1M.
 
 ## What it implements
 
