@@ -480,6 +480,34 @@ h.add(vectors)                       # stores codes + fp32 (for rerank)
 ids, dists = h.search(queries, k=10, ef=200)
 h.memory_bytes(include_fp32=False)   # resident footprint w/ mmap'd fp32
 ```
+
+#### Memory at matched recall (vs FAISS quantized indexes)
+
+Quantized indexes compete on bytes/vector, not speed. 50k x 128 clustered,
+recall@10 vs exact ground truth (`benchmarks/bench_quant_memory.py`):
+
+| index                         | bytes/vec | recall@10 | vs fp32 |
+|-------------------------------|-----------|-----------|---------|
+| faiss IndexFlatL2 (fp32)      | 512       | 1.000     | 1.0x    |
+| **vecdb Hybrid 8-bit**        | 293\*     | **1.000** | 1.7x    |
+| **vecdb Hybrid 4-bit**        | 225\*     | **1.000** | 2.3x    |
+| faiss IndexHNSWPQ             | 64        | 0.721     | 8.0x    |
+| faiss SQ 8-bit                | 128       | 0.975     | 4.0x    |
+| vecdb TQIndex 8-bit           | 148       | 0.943     | 3.5x    |
+| vecdb TQIndex 4-bit           | 80        | 0.656     | 6.4x    |
+
+The hybrid is the result that matters: it reaches **recall 1.000** — matching
+exact fp32 — at ~2x less memory, where FAISS's quantized graph (IndexHNSWPQ)
+saves more bytes but drops to 0.721 recall. The rerank recovers what the
+4-bit codes lose (4-bit alone is 0.656; wrapped in the graph + rerank it's
+1.000).
+
+Honestly: standalone TQIndex does *not* beat FAISS's scalar quantizer
+(SQ 8-bit is 0.975 @ 128 B vs TQIndex 8-bit 0.943 @ 148 B) — TurboQuant's
+value here is as the compression stage *inside* the hybrid, not as a
+standalone index. \*Hybrid bytes/vec is the resident footprint (codes +
+graph); fp32 is assumed memory-mapped for the rerank, the standard
+production pattern. FAISS rows are fully in-memory.
  On *uniform* random
 128-d data the same index scores ~0.42 recall@10 at ef=200 — uniform
 high-dimensional data breaks HNSW's navigability assumptions at scale;
