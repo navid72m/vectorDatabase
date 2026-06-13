@@ -1,6 +1,6 @@
 [project]
 name = "vecdbc"
-version = "0.1.0"
+version = "0.1.1"
 description = "A from-scratch vector database in C (HNSW + TurboQuant + hybrid) with Python bindings"
 readme = "README.md"
 requires-python = ">=3.8"

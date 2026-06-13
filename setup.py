@@ -63,4 +63,9 @@ class build_py_with_lib(build_py):
                     "set CC to a working C compiler")
 
 
-setup(cmdclass={"build_py": build_py_with_lib})
+setup(
+    name="vecdbc",
+    version="0.1.1",
+    py_modules=["pyvecdb"],
+    cmdclass={"build_py": build_py_with_lib},
+)
