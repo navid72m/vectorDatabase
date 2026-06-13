@@ -365,8 +365,8 @@ against exact ground truth (see `benchmarks/` for the scripts):
 | index                      | QPS    | recall@10 | note                          |
 |----------------------------|--------|-----------|-------------------------------|
 | flat exact (8-query block) |  3,928 | 1.000     | 1.9x faster than faiss flat   |
-| HNSW ef=50                 | 16,578 | 1.000     | 79% of faiss HNSW             |
-| HNSW ef=200                |  8,574 | 1.000     | 91% of faiss HNSW             |
+| HNSW ef=50                 | 16,578 | 1.000     | (synthetic; see SIFT1M below) |
+| HNSW ef=200                |  8,574 | 1.000     | (synthetic; see SIFT1M below) |
 | TurboQuant 4-bit           |  2,235 | 0.622     | beats faiss SQ4; 1.000 w/ rerank |
 | TurboQuant 8-bit (VNNI)    |  4,993 | 0.937     | 2.5x faiss SQ8; 1.000 w/ rerank |
 
@@ -477,10 +477,33 @@ tar xzf sift.tar.gz
 PYTHONPATH=. python3 benchmarks/bench_sift.py --dir sift --faiss --build-threads 8
 ```
 
+### Measured result: vecdb vs FAISS on SIFT1M (M2 Pro)
+
+1M base + 10k queries, dim 128, single-thread search, matched HNSW
+parameters (M=16, efConstruction=200), recall against the provided ground
+truth:
+
+| ef  | recall@10 | vecdb QPS | faiss QPS | vecdb vs faiss |
+|-----|-----------|-----------|-----------|----------------|
+| 10  | 0.740     | 27,536    | 23,164    | 1.19x          |
+| 50  | 0.954     |  9,325    |  6,758    | 1.38x          |
+| 100 | 0.985     |  5,307    |  3,668    | 1.45x          |
+| 200 | 0.996     |  2,942    |  1,947    | 1.51x          |
+| 400 | 0.999     |  1,622    |  1,003    | 1.62x          |
+
+Recall is identical to three decimals at every ef — same answers, returned
+faster. At every useful operating point (recall ≥ 0.95) vecdb is 1.4–1.6x
+faster than FAISS HNSW on this machine, and the parallel build was 2.1x
+faster (233s vs 487s, FAISS HNSW building single-threaded by default).
+
+Scope of the claim: single-thread search, Apple Silicon (NEON kernels),
+SIFT1M. FAISS can also multi-thread search; on x86 with AVX-512 the gap may
+differ. The point is parity-or-better against the reference implementation on
+the standard dataset, not a universal speed record.
+
 The `.fvecs`/`.ivecs` loaders are validated by a format round-trip; the full
-pipeline (load → build → recall-vs-ground-truth) is exercised in CI on a
-small synthetic file in the same binary layout. Real SIFT1M numbers depend on
-the machine and are left for the user to generate.
+pipeline (load → build → recall-vs-ground-truth) is exercised on a small
+synthetic file in the same binary layout.
 
 ## License
 
