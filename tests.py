@@ -178,6 +178,25 @@ for th in threads: th.join()
 ok = all(np.array_equal(r, ref) for outs in results for r in outs)
 check("4 threads x 5 searches all match single-threaded reference", ok)
 
+# ---------------------------------------------------------------- concurrent insert
+print("concurrent insert (graph equivalence):")
+Xp = (rng.uniform(-1,1,(64,96))[rng.integers(0,64,8000)]
+      + 0.15*rng.standard_normal((8000,96))).astype(np.float32)
+Qp = rng.standard_normal((80, 96)).astype(np.float32)
+idp = np.arange(8000, dtype=np.uint64)
+Dp = ((Qp[:,None,:]-Xp[None,:,:])**2).sum(-1); gtp = np.argsort(Dp,axis=1)[:,:10]
+def _rp(r): return np.mean([len(set(a.tolist())&set(b.tolist()))/10
+                            for a,b in zip(r.astype(np.int64),gtp)])
+sdb = VecDB(dim=96, capacity=8000); sdb.add_bulk(idp, Xp, threads=1)
+rs = _rp(sdb.search(Qp, k=10, ef=200)[0])
+cdb = VecDB(dim=96, capacity=8000); cdb.add_bulk(idp, Xp, threads=4)
+rc = _rp(cdb.search(Qp, k=10, ef=200)[0])
+check("concurrent build len correct", len(cdb) == 8000)
+check("concurrent recall matches serial (+-0.02)", abs(rc - rs) <= 0.02,
+      f"serial {rs:.3f} vs threads=4 {rc:.3f}")
+ci, _ = cdb.search(Xp[:200], k=1, exact=True)
+check("concurrent build: all ids retrievable", (ci[:,0] == np.arange(200)).all())
+
 # ---------------------------------------------------------------- hybrid index
 print("hybrid (HNSW over codes + fp32 rerank):")
 from pyvecdb import HybridIndex

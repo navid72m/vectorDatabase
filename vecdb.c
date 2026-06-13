@@ -10,6 +10,7 @@
 #include "vecdb.h"
 #ifdef _OPENMP
 #include <omp.h>
+#include <stdatomic.h>
 #endif
 #include <stdlib.h>
 #include <string.h>
@@ -590,6 +591,184 @@ int64_t vecdb_add(VecDB *db, uint64_t id, const float *vec)
  * the bulk path produces a byte-identical graph to repeated vecdb_add.
  *
  * threads<=0 uses the OpenMP default; without OpenMP it runs serial. */
+#ifdef _OPENMP
+/* TSan can't see omp_lock_t synchronization (libgomp isn't annotated),
+ * so wrap locks with happens-before annotations under TSan to suppress
+ * false positives and surface any *real* races. No-ops otherwise. */
+#if defined(__SANITIZE_THREAD__)
+void __tsan_acquire(void *addr);
+void __tsan_release(void *addr);
+#define OMP_LOCK(l)   do { omp_set_lock(l);  __tsan_acquire((void*)(l)); } while(0)
+#define OMP_UNLOCK(l) do { __tsan_release((void*)(l)); omp_unset_lock(l); } while(0)
+#else
+#define OMP_LOCK(l)   omp_set_lock(l)
+#define OMP_UNLOCK(l) omp_unset_lock(l)
+#endif
+/* ================================================================== */
+/* Concurrent HNSW graph construction.                                 */
+/*                                                                     */
+/* Correctness model (designed before the locks, not after):           */
+/*  - Storage (vector, norm, level, upper block) for ALL new nodes is  */
+/*    allocated in a serial pass before any wiring starts, so          */
+/*    node_level[v] and upper[v] are always safe to read.              */
+/*  - `published[v]` (release on set, acquire on read) flips true only  */
+/*    after v's links at every level are fully wired. Traversal only    */
+/*    follows edges INTO already-published nodes, so no thread ever     */
+/*    reads a half-wired link list of a node that just appeared.        */
+/*  - Each node's link lists are guarded by clk[v]: every read snapshots*/
+/*    under the lock, every append/shrink holds it. This covers the    */
+/*    back-link mutation of an already-published neighbour.             */
+/*  - The entry point / max_level pair is guarded by a global lock and  */
+/*    is only advanced to a node after that node is published.          */
+/* ================================================================== */
+#define CSNAP 128                              /* >= max M0 + slack */
+
+typedef struct {
+    omp_lock_t *clk;            /* per-node link locks                  */
+    _Atomic unsigned char *pub; /* published flag per node              */
+    omp_lock_t  glk;            /* entry point + max_level              */
+} Ctx;
+
+/* snapshot a published node's links at `level` under its lock */
+static uint32_t csnap(const VecDB *db, Ctx *cx, uint32_t node, int level, uint32_t *buf)
+{
+    if (level > db->node_level[node]) return 0;
+    OMP_LOCK(&cx->clk[node]);
+    const uint32_t *L = node_links(db, node, level);
+    uint32_t n = L[0]; if (n > CSNAP) n = CSNAP;
+    for (uint32_t j = 1; j <= n; j++) buf[j-1] = L[j];
+    OMP_UNLOCK(&cx->clk[node]);
+    return n;
+}
+
+static uint32_t cgreedy(const VecDB *db, Ctx *cx, const float *q, uint32_t ep, int level)
+{
+    uint32_t cur = ep, snap[CSNAP];
+    float best = l2sq(q, vec_at(db, cur), db->dim);
+    int moved = 1;
+    while (moved) {
+        moved = 0;
+        uint32_t n = csnap(db, cx, cur, level, snap);
+        for (uint32_t j = 0; j < n; j++) {
+            uint32_t nb = snap[j];
+            if (!atomic_load_explicit(&cx->pub[nb], memory_order_acquire)) continue;
+            float d = l2sq(q, vec_at(db, nb), db->dim);
+            if (d < best) { best = d; cur = nb; moved = 1; }
+        }
+    }
+    return cur;
+}
+
+/* beam search on a layer, results in res (max-heap), traversal published-only */
+static void csearch(const VecDB *db, Ctx *cx, const float *q, uint32_t ep,
+                    int ef, int level, Heap *res)
+{
+    uint32_t epoch; uint32_t *vis = visited_acquire(db->cap, &epoch);
+    Heap cand; heap_init(&cand, ef + 1, 0);
+    uint32_t snap[CSNAP];
+    float d0 = l2sq(q, vec_at(db, ep), db->dim);
+    vis[ep] = epoch; heap_push(&cand, d0, ep); heap_push(res, d0, ep);
+    while (cand.n > 0) {
+        HItem c = heap_pop(&cand);
+        if (res->n >= ef && c.dist > res->a[0].dist) break;
+        uint32_t n = csnap(db, cx, c.node, level, snap);
+        for (uint32_t j = 0; j < n; j++) {
+            uint32_t nb = snap[j];
+            if (vis[nb] == epoch) continue; vis[nb] = epoch;
+            if (!atomic_load_explicit(&cx->pub[nb], memory_order_acquire)) continue;
+            float d = l2sq(q, vec_at(db, nb), db->dim);
+            if (res->n < ef || d < res->a[0].dist) {
+                heap_push(&cand, d, nb);
+                heap_push(res, d, nb);
+                if (res->n > ef) heap_pop(res);
+            }
+        }
+    }
+    heap_destroy(&cand);
+}
+
+/* add nb to node's list at level under node's lock; shrink if overfull */
+static void clink(VecDB *db, Ctx *cx, uint32_t node, uint32_t nb, int level)
+{
+    OMP_LOCK(&cx->clk[node]);
+    uint32_t *L = node_links(db, node, level);
+    /* guard against duplicate (a retry could re-add) */
+    int dup = 0; for (uint32_t j = 1; j <= L[0]; j++) if (L[j] == nb) { dup = 1; break; }
+    if (!dup) {
+        L[1 + L[0]] = nb; L[0]++;
+        if ((int)L[0] > link_cap(db, level)) shrink_links(db, node, level);
+    }
+    OMP_UNLOCK(&cx->clk[node]);
+}
+
+static void cwire(VecDB *db, Ctx *cx, uint32_t idx, const float *vec)
+{
+    int level = db->node_level[idx];
+
+    OMP_LOCK(&cx->glk);
+    uint32_t ep = (uint32_t)db->entry;
+    int max_level = db->max_level;
+    OMP_UNLOCK(&cx->glk);
+
+    for (int l = max_level; l > level; l--)
+        ep = cgreedy(db, cx, vec, ep, l);
+
+    int start = level < max_level ? level : max_level;
+    for (int l = start; l >= 0; l--) {
+        Heap res; heap_init(&res, db->ef_construction + 1, 1);
+        csearch(db, cx, vec, ep, db->ef_construction, l, &res);
+        uint32_t *sel = malloc((size_t)db->M * sizeof(uint32_t));
+        int kept = select_neighbors(db, vec, res.a, res.n, db->M, sel);
+        /* link new -> selected (idx not yet published; still lock for shrink) */
+        for (int j = 0; j < kept; j++) clink(db, cx, idx, sel[j], l);
+        /* link selected -> new */
+        for (int j = 0; j < kept; j++) clink(db, cx, sel[j], idx, l);
+        float bd = 1e30f; uint32_t bn = ep;
+        for (int j = 0; j < res.n; j++)
+            if (res.a[j].dist < bd) { bd = res.a[j].dist; bn = res.a[j].node; }
+        ep = bn;
+        free(sel); heap_destroy(&res);
+    }
+
+    /* publish: now safe to be a traversal target */
+    atomic_store_explicit(&cx->pub[idx], 1, memory_order_release);
+
+    if (level > max_level) {
+        OMP_LOCK(&cx->glk);
+        if (level > db->max_level) { db->max_level = level; db->entry = idx; }
+        OMP_UNLOCK(&cx->glk);
+    }
+}
+
+/* Concurrent wiring of nodes [base, base+n) already stored in Phase 1.
+ * node `seed` (if >=0) is the pre-published entry point. */
+static void concurrent_wire(VecDB *db, size_t base, size_t n, const float *vecs,
+                            int64_t seed, int threads)
+{
+    Ctx *cx = malloc(sizeof(Ctx));              /* heap: shared, stable */
+    cx->clk = malloc(db->count * sizeof(omp_lock_t));
+    cx->pub = malloc(db->count * sizeof(_Atomic unsigned char));
+    for (size_t i = 0; i < db->count; i++) {
+        omp_init_lock(&cx->clk[i]);
+        atomic_store_explicit(&cx->pub[i], (i < base) ? 1 : 0, memory_order_relaxed);
+    }
+    if (seed >= 0) atomic_store_explicit(&cx->pub[seed], 1, memory_order_relaxed);
+    omp_init_lock(&cx->glk);
+    if (threads > 0) omp_set_num_threads(threads);
+
+    #pragma omp parallel for schedule(dynamic, 32) firstprivate(cx, db, vecs, base, n, seed)
+    for (size_t i = 0; i < n; i++) {
+        uint32_t idx = (uint32_t)(base + i);
+        if ((int64_t)idx == seed) continue;        /* already published */
+        cwire(db, cx, idx, vecs + i * (size_t)db->dim);
+    }
+
+    for (size_t i = 0; i < db->count; i++) omp_destroy_lock(&cx->clk[i]);
+    omp_destroy_lock(&cx->glk);
+    free(cx->clk); free((void *)cx->pub); free(cx);
+}
+#endif /* _OPENMP */
+
 static int bulk_insert(VecDB *db, const uint64_t *ids, const float *vecs,
                        size_t n, int threads)
 {
@@ -644,11 +823,23 @@ static int bulk_insert(VecDB *db, const uint64_t *ids, const float *vecs,
 
     /* first-ever element: seed the entry point */
     size_t start_i = 0;
+    int64_t seed = -1;
     if (db->entry < 0) {
         db->entry = (int64_t)base;
         db->max_level = db->node_level[base];
+        seed = (int64_t)base;
         start_i = 1;
     }
+
+#ifdef _OPENMP
+    if (threads != 1) {
+        /* Phase 2 (concurrent): graph wiring across threads. Produces an
+         * equivalent-quality graph (not bit-identical: neighbor-list order
+         * depends on thread interleaving). */
+        concurrent_wire(db, base, n, vecs, seed, threads);
+        return 0;
+    }
+#endif
 
     /* Phase 2 (serial): graph wiring, identical to single-threaded build. */
     for (size_t i = start_i; i < n; i++)

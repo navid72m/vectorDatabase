@@ -14,6 +14,7 @@
 - **Filtered search** — restrict any search to an allow-list or away from a deny-list of IDs; HNSW traverses through filtered nodes so selective filters cannot disconnect the search.
 - **Concurrent reads** — searches are thread-safe (per-thread visited buffers, no shared mutable state); any number of threads may search one index simultaneously. Writes require external exclusion.
 - **OpenMP batch search** — `make OMP=1` parallelizes batched HNSW, exact, and TurboQuant searches over queries. Single-threaded behavior is unchanged; results are identical either way.
+- **Parallel insert (experimental)** — `add_bulk(ids, vecs, threads=N)` builds the HNSW graph concurrently using a published-node model: a node becomes a traversal target (atomic release/acquire flag) only after its links are fully wired, and per-node locks guard every link-list read and mutation. Produces a graph of equivalent recall to the serial build (verified to within +-0.02 at up to 16 threads, ASan-clean). The serial path is the default and is byte-identical to repeated single inserts.
 - **NEON kernels** — on AArch64 (Apple Silicon, Graviton, ...) the distance kernel, blocked exact scan, and both TurboQuant scans use NEON; the 4-bit codebook decodes via a single `tbl` table register and both quantized scans run on `sdot` (signed x signed, so no zero-point correction). Verified against scalar references under QEMU in CI.
 - **Hybrid index (HNSW + TurboQuant + rerank)** — an HNSW graph that traverses on TurboQuant code distances and reranks the top candidates with exact fp32; matches pure-fp32 recall while the resident footprint (codes + graph) is smaller than the fp32 vectors alone.
 - **TurboQuant compressed index** — optional 4-bit or 8-bit compressed brute-force index with randomized Hadamard rotation, norm separation, Lloyd-Max Gaussian quantization, and optional QJL residual estimation.
@@ -333,6 +334,7 @@ Distances returned by `TQIndex.search()` are estimated squared L2 distances for 
 - Single writer: add/delete/compact must be externally excluded from each other and from searches. Concurrent searches are safe.
 - Very selective allow-lists (under ~1% of vectors) can return fewer than k HNSW results; use `exact=True` or raise `ef` for those.
 - Tombstoned slots are not reused by inserts; memory is reclaimed only by `compact()`. Long-running high-churn workloads should compact periodically.
+- Parallel insert (`threads>1`) is experimental: correctness is validated by recall-equivalence and AddressSanitizer, but ThreadSanitizer cannot fully verify it because libgomp's `omp_lock_t` synchronization is invisible to TSan (residual reports are lock-protected accesses TSan can't see). The default serial path is the verified one.
 - `compact()` rebuilds the whole graph (O(N log N) inserts), so it is a maintenance operation, not a per-delete cost.
 - TurboQuant is a brute-force compressed index; it does not build an HNSW graph.
 - TurboQuant has no delete or save/load API yet.
