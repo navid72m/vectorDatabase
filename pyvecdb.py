@@ -302,3 +302,82 @@ class TQIndex:
                 out_ids[i, j] = buf[i * k + j].id
                 out_dists[i, j] = buf[i * k + j].dist
         return out_ids, out_dists
+
+
+# ---------------------------------------------------------------------------
+# HybridIndex — HNSW over TurboQuant codes + fp32 rerank (Design A + B)
+# ---------------------------------------------------------------------------
+class _HybridConfig(Structure):
+    _fields_ = [("dim", c_int), ("M", c_int), ("ef_construction", c_int),
+                ("bits", c_int), ("qjl", c_int), ("rerank_mult", c_int),
+                ("initial_capacity", c_size_t), ("seed", c_uint64)]
+
+_lib.hybrid_create.argtypes = [POINTER(_HybridConfig)]
+_lib.hybrid_create.restype = c_void_p
+_lib.hybrid_free.argtypes = [c_void_p]
+_lib.hybrid_add.argtypes = [c_void_p, c_uint64, POINTER(c_float)]
+_lib.hybrid_add.restype = c_int64
+_lib.hybrid_search.argtypes = [c_void_p, POINTER(c_float), c_int, c_int, POINTER(_VecResult)]
+_lib.hybrid_search.restype = c_int
+_lib.hybrid_count.argtypes = [c_void_p]
+_lib.hybrid_count.restype = c_size_t
+_lib.hybrid_memory_bytes.argtypes = [c_void_p, c_int]
+_lib.hybrid_memory_bytes.restype = c_size_t
+
+
+class HybridIndex:
+    """HNSW graph traversing on TurboQuant codes, with fp32 rerank.
+
+    Cuts hot-path memory to ~bits/32 of an fp32 graph (Design A) and
+    recovers recall by re-scoring the top candidates exactly (Design B).
+    """
+
+    def __init__(self, dim, M=16, ef_construction=200, bits=8, qjl=False,
+                 rerank_mult=4, capacity=1024, seed=0x9E3779B97F4A7C15):
+        cfg = _HybridConfig(dim, M, ef_construction, bits, 1 if qjl else 0,
+                            rerank_mult, capacity, seed)
+        self._h = _lib.hybrid_create(ctypes.byref(cfg))
+        if not self._h:
+            raise RuntimeError("hybrid_create failed")
+        self.dim = dim
+
+    def __del__(self):
+        h = getattr(self, "_h", None)
+        if h:
+            _lib.hybrid_free(h); self._h = None
+
+    def __len__(self):
+        return _lib.hybrid_count(self._h)
+
+    def add(self, vectors, ids=None):
+        vectors = _as_f32_matrix(vectors, self.dim)
+        n = vectors.shape[0]
+        if ids is None:
+            ids = np.arange(len(self), len(self) + n, dtype=np.uint64)
+        else:
+            ids = np.ascontiguousarray(ids, dtype=np.uint64)
+        fp = vectors.ctypes.data_as(POINTER(c_float))
+        for i in range(n):
+            row = ctypes.cast(ctypes.addressof(fp.contents) + i * self.dim * 4,
+                              POINTER(c_float))
+            if _lib.hybrid_add(self._h, int(ids[i]), row) < 0:
+                raise RuntimeError(f"hybrid_add failed at row {i}")
+
+    def search(self, queries, k=10, ef=100):
+        queries = _as_f32_matrix(queries, self.dim)
+        nq = queries.shape[0]
+        out_ids = np.full((nq, k), np.iinfo(np.uint64).max, dtype=np.uint64)
+        out_dists = np.full((nq, k), np.inf, dtype=np.float32)
+        buf = (_VecResult * k)()
+        qp = queries.ctypes.data_as(POINTER(c_float))
+        for i in range(nq):
+            row = ctypes.cast(ctypes.addressof(qp.contents) + i * self.dim * 4,
+                              POINTER(c_float))
+            n = _lib.hybrid_search(self._h, row, k, ef, buf)
+            for j in range(n):
+                out_ids[i, j] = buf[j].id
+                out_dists[i, j] = buf[j].dist
+        return out_ids, out_dists
+
+    def memory_bytes(self, include_fp32=True):
+        return _lib.hybrid_memory_bytes(self._h, 1 if include_fp32 else 0)

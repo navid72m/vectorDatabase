@@ -1,5 +1,5 @@
 CC      ?= cc
-SRC      = vecdb.c turboquant.c
+SRC      = vecdb.c turboquant.c hybrid.c
 OBJ      = $(SRC:.c=.o)
 
 # Per-platform tuning: -march=native is rejected by clang on Apple Silicon;
@@ -28,7 +28,7 @@ all: libvecdb.so
 libvecdb.so: $(OBJ)
 	$(CC) $(LDSHARED) $(OMPLD) -o $@ $^ -lm
 
-%.o: %.c vecdb.h turboquant.h
+%.o: %.c vecdb.h turboquant.h hybrid.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # bench is compiled statically from sources: no rpath/LD_LIBRARY_PATH needed

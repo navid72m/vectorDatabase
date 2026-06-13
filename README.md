@@ -15,6 +15,7 @@
 - **Concurrent reads** — searches are thread-safe (per-thread visited buffers, no shared mutable state); any number of threads may search one index simultaneously. Writes require external exclusion.
 - **OpenMP batch search** — `make OMP=1` parallelizes batched HNSW, exact, and TurboQuant searches over queries. Single-threaded behavior is unchanged; results are identical either way.
 - **NEON kernels** — on AArch64 (Apple Silicon, Graviton, ...) the distance kernel, blocked exact scan, and both TurboQuant scans use NEON; the 4-bit codebook decodes via a single `tbl` table register and both quantized scans run on `sdot` (signed x signed, so no zero-point correction). Verified against scalar references under QEMU in CI.
+- **Hybrid index (HNSW + TurboQuant + rerank)** — an HNSW graph that traverses on TurboQuant code distances and reranks the top candidates with exact fp32; matches pure-fp32 recall while the resident footprint (codes + graph) is smaller than the fp32 vectors alone.
 - **TurboQuant compressed index** — optional 4-bit or 8-bit compressed brute-force index with randomized Hadamard rotation, norm separation, Lloyd-Max Gaussian quantization, and optional QJL residual estimation.
 
 The C API is declared in `vecdb.h`. The Python API lives in `pyvecdb.py` and loads `libvecdb.so` from the project directory by default.
@@ -83,6 +84,7 @@ make bench
 |-------|---------|
 | `VecDB` | Full vector index with flat exact search, HNSW approximate search, delete, save, and load |
 | `TQIndex` | TurboQuant compressed brute-force index |
+| `HybridIndex` | HNSW over TurboQuant codes with fp32 rerank (Design A + B) |
 
 ### `VecDB`
 
@@ -341,7 +343,8 @@ Distances returned by `TQIndex.search()` are estimated squared L2 distances for 
 ```text
 vecdb.h        # C API
 vecdb.c        # VecDB storage, flat search, HNSW, persistence
-turboquant.c   # TurboQuant compressed index
+turboquant.c   # TurboQuant compressed index (+ codec API for the hybrid)
+hybrid.c       # HNSW-over-codes + fp32 rerank index
 pyvecdb.py     # ctypes Python bindings
 bench.c        # small random-data smoke/demo program
 Makefile       # build rules for libvecdb.so and bench
@@ -380,7 +383,27 @@ against exact ground truth (`benchmarks/bench_large.py --n 1000000`):
 | 200 |  5,427 | 0.989     |
 | 400 |  3,836 | 0.999     |
 
-Build: 178s (5,622 vec/s) with capacity preallocated. On *uniform* random
+Build: 178s (5,622 vec/s) with capacity preallocated.
+
+### Hybrid index: recall of fp32, memory of codes
+
+The hybrid runs the HNSW graph on TurboQuant codes (Design A) and reranks
+the top candidates with exact fp32 (Design B). On 30k x 128 clustered
+vectors it reaches recall@10 = 1.000 at ef=200 — matching pure-fp32 HNSW —
+while the resident structures (codes + graph; fp32 is memory-mappable) take
+~8.8 MB vs 15.4 MB for the fp32 vectors alone. The quantized graph alone
+(no rerank) tracks pure-TurboQuant brute force; the rerank is what lifts it
+to fp32 parity, and the HNSW neighbor-diversity heuristic on the quantized
+graph is what makes the rerank candidates good enough to matter.
+
+```python
+from pyvecdb import HybridIndex
+h = HybridIndex(dim=128, bits=8, ef_construction=200, rerank_mult=4)
+h.add(vectors)                       # stores codes + fp32 (for rerank)
+ids, dists = h.search(queries, k=10, ef=200)
+h.memory_bytes(include_fp32=False)   # resident footprint w/ mmap'd fp32
+```
+ On *uniform* random
 128-d data the same index scores ~0.42 recall@10 at ef=200 — uniform
 high-dimensional data breaks HNSW's navigability assumptions at scale;
 that is a property of the data, not the implementation, and is why

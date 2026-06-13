@@ -178,5 +178,27 @@ for th in threads: th.join()
 ok = all(np.array_equal(r, ref) for outs in results for r in outs)
 check("4 threads x 5 searches all match single-threaded reference", ok)
 
+# ---------------------------------------------------------------- hybrid index
+print("hybrid (HNSW over codes + fp32 rerank):")
+from pyvecdb import HybridIndex
+Ch = rng.uniform(-1, 1, (64, 128)).astype(np.float32)
+Xh = (Ch[rng.integers(0, 64, 20000)] + 0.15 * rng.standard_normal((20000, 128))).astype(np.float32)
+Qh = (Ch[rng.integers(0, 64, 100)] + 0.15 * rng.standard_normal((100, 128))).astype(np.float32)
+Dh = ((Qh[:, None, :] - Xh[None, :, :]) ** 2).sum(-1)
+gth = np.argsort(Dh, axis=1)[:, :10]
+for bits in (4, 8):
+    hyb = HybridIndex(128, bits=bits, ef_construction=200, rerank_mult=4)
+    hyb.add(Xh)
+    check(f"hybrid {bits}-bit len", len(hyb) == 20000)
+    idh, _ = hyb.search(Qh, k=10, ef=200)
+    rh = np.mean([len(set(a.tolist()) & set(b.tolist()))/10
+                  for a, b in zip(idh.astype(np.int64), gth)])
+    check(f"hybrid {bits}-bit recall@10 >= 0.95 (ef=200)", rh >= 0.95, f"{rh:.3f}")
+# resident memory (codes+graph, fp32 mmap-able) is below fp32-vectors alone
+hyb = HybridIndex(128, bits=4); hyb.add(Xh)
+fp32_only = 20000 * 128 * 4
+check("hybrid 4-bit resident < fp32 vectors", hyb.memory_bytes(False) < fp32_only,
+      f"{hyb.memory_bytes(False)/1e6:.1f}MB vs {fp32_only/1e6:.1f}MB")
+
 print(f"\n{'ALL TESTS PASS' if FAILS == 0 else f'{FAILS} FAILURES'}")
 sys.exit(1 if FAILS else 0)

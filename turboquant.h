@@ -40,3 +40,14 @@ int tq_search_batch(const TQIndex *tq, const float *queries, int nq, int k,
 size_t tq_memory_bytes(const TQIndex *tq);
 
 #endif /* TURBOQUANT_H */
+
+/* ---- codec API for the hybrid HNSW-over-codes index ----
+ * tq_encode stores a vector's code (== tq_add). tq_query_begin builds a
+ * reusable per-query context; tq_score_code returns the estimated squared
+ * L2 distance from that query to stored code `slot`; tq_query_free releases
+ * it. These let an external graph traverse on TurboQuant code distances. */
+typedef struct TQQuery TQQuery;
+int64_t  tq_encode(TQIndex *tq, uint64_t id, const float *vec);
+TQQuery *tq_query_begin(const TQIndex *tq, const float *query);
+float    tq_score_code(const TQQuery *q, uint32_t slot);
+void     tq_query_free(TQQuery *q);

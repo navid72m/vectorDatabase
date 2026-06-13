@@ -462,124 +462,152 @@ static float tq_signdot_scalar(const float *Sq, const uint8_t *bits, int pdim)
     return s;
 }
 
-int tq_search(const TQIndex *tq_c, const float *query, int k, VecResult *out)
+/* ================================================================== */
+/* Query context: per-query prep + per-code scoring, factored out of   */
+/* tq_search so external callers (the hybrid HNSW-over-codes index)    */
+/* can score one code at a time during graph traversal.                */
+/* ================================================================== */
+struct TQQuery {
+    const TQIndex *tq;
+    float  *qr;           /* rotated, padded query                    */
+    float   qn;           /* ||qr||^2                                  */
+    float  *Sq;           /* QJL: S * qr (or NULL)                     */
+    float   qjl_const;
+    uint8_t *qu8;         /* int8 query (unsigned+128) or NULL         */
+    int8_t  *qi8;         /* int8 query (signed) or NULL               */
+    float   i8_inv_scale;
+    int     use_i8;
+    int     simd;
+    float   inv_sd;
+};
+
+TQQuery *tq_query_begin(const TQIndex *tq, const float *query)
 {
-    TQIndex *tq = (TQIndex *)tq_c;   /* uses scratch only */
-    if (!tq || tq->count == 0 || k <= 0) return 0;
-    if ((size_t)k > tq->count) k = (int)tq->count;
+    TQQuery *q = calloc(1, sizeof(TQQuery));
+    q->tq = tq;
+    q->inv_sd = 1.0f / sqrtf((float)tq->pdim);
+    q->qr = malloc(tq->pdim * sizeof(float));
+    memcpy(q->qr, query, (size_t)tq->dim * sizeof(float));
+    memset(q->qr + tq->dim, 0, (size_t)(tq->pdim - tq->dim) * sizeof(float));
+    tq_rotate(tq, q->qr);
 
-    float *qr = malloc(tq->pdim * sizeof(float));
-    memcpy(qr, query, (size_t)tq->dim * sizeof(float));
-    memset(qr + tq->dim, 0, (size_t)(tq->pdim - tq->dim) * sizeof(float));
-    tq_rotate(tq, qr);
+    q->qn = 0.f;
+    for (int i = 0; i < tq->pdim; i++) q->qn += q->qr[i] * q->qr[i];
 
-    float qn = 0.f;
-    for (int i = 0; i < tq->pdim; i++) qn += qr[i] * qr[i];
-
-    /* QJL query prep: Sq = S * qr (once per query), plus the estimator's
-     * sqrt(pi/2)/pdim constant from Definition 1 of the paper. */
-    float *Sq = NULL;
-    float qjl_const = 0.f;
     if (tq->qjl) {
-        Sq = malloc(tq->pdim * sizeof(float));
+        q->Sq = malloc(tq->pdim * sizeof(float));
         for (int i = 0; i < tq->pdim; i++)
-            Sq[i] = tq_dotf(tq->S + (size_t)i * tq->pdim, qr, tq->pdim);
-        qjl_const = sqrtf((float)M_PI / 2.0f) / (float)tq->pdim;
+            q->Sq[i] = tq_dotf(tq->S + (size_t)i * tq->pdim, q->qr, tq->pdim);
+        q->qjl_const = sqrtf((float)M_PI / 2.0f) / (float)tq->pdim;
     }
-
 #ifdef TQ_HAVE_SIMD
-    const int simd = (tq->pdim % 16) == 0;
+    q->simd = (tq->pdim % 16) == 0;
 #endif
-
-    /* int8 query prep: quantize qr once per query. NEON+SDOT scans both
-     * bit-widths as signed int8 (4-bit decodes via tbl); x86 keeps the
-     * float permutexvar path for 4-bit and uses VNNI (unsigned+bias) or
-     * scalar for 8-bit. */
-    uint8_t *qu8 = NULL;          /* unsigned + 128 offset (VNNI/scalar) */
-    int8_t  *qi8 = NULL;          /* signed (NEON SDOT)                  */
-    float i8_inv_scale = 0.f;     /* 1 / (s8q * s8x) */
-    int use_i8 = 0;
 #if defined(TQ_NEON_DOT)
-    int want_i8 = (tq->pdim % 16) == 0;            /* 4-bit and 8-bit */
+    int want_i8 = (tq->pdim % 16) == 0;
 #else
     int want_i8 = (tq->bits == 8);
 #endif
     if (want_i8) {
         float qmax = 0.f;
         for (int i = 0; i < tq->pdim; i++) {
-            float a = fabsf(qr[i]);
+            float a = fabsf(q->qr[i]);
             if (a > qmax) qmax = a;
         }
         if (qmax > 0.f) {
             float s8q = 127.0f / qmax;
-            qi8 = malloc(tq->pdim);
+            q->qi8 = malloc(tq->pdim);
             for (int i = 0; i < tq->pdim; i++) {
-                int q = (int)lrintf(qr[i] * s8q);
-                if (q >  127) q =  127;
-                if (q < -127) q = -127;
-                qi8[i] = (int8_t)q;
+                int v = (int)lrintf(q->qr[i] * s8q);
+                if (v >  127) v =  127;
+                if (v < -127) v = -127;
+                q->qi8[i] = (int8_t)v;
             }
 #if !defined(TQ_NEON_DOT)
-            qu8 = malloc(tq->pdim);
+            q->qu8 = malloc(tq->pdim);
             for (int i = 0; i < tq->pdim; i++)
-                qu8[i] = (uint8_t)((int)qi8[i] + 128);
+                q->qu8[i] = (uint8_t)((int)q->qi8[i] + 128);
 #endif
-            i8_inv_scale = 1.0f / (s8q * tq->s8x);
-            use_i8 = 1;
+            q->i8_inv_scale = 1.0f / (s8q * tq->s8x);
+            q->use_i8 = 1;
         }
     }
+    return q;
+}
 
-    /* simple bounded max-heap over (dist, idx) */
+void tq_query_free(TQQuery *q)
+{
+    if (!q) return;
+    free(q->qr); free(q->Sq); free(q->qu8); free(q->qi8); free(q);
+}
+
+/* Estimated squared-L2 distance between the query and stored code `v`. */
+float tq_score_code(const TQQuery *q, uint32_t v)
+{
+    const TQIndex *tq = q->tq;
+    const uint8_t *code = tq->codes + (size_t)v * tq->code_bytes;
+    float dot;
+    if (q->use_i8) {
+#if defined(TQ_NEON_DOT)
+        int32_t di = (tq->bits == 4)
+            ? tq_dot4_neon(q->qi8, code, tq->pdim, tq->l8)
+            : tq_dot8_neon(q->qi8, (const int8_t *)code, tq->pdim);
+        dot = (float)di * q->i8_inv_scale;
+#else
+        int32_t di;
+#ifdef TQ_HAVE_VNNI
+        if ((tq->pdim % 64) == 0)
+            di = tq_doti8_vnni(q->qu8, (const int8_t *)code, tq->pdim);
+        else
+#endif
+            di = tq_doti8_scalar(q->qu8, (const int8_t *)code, tq->pdim);
+        dot = (float)(di - 128 * tq->i8sums[v]) * q->i8_inv_scale;
+#endif
+    }
+#ifdef TQ_HAVE_SIMD
+    else if (q->simd && tq->bits == 4)
+        dot = tq_dot4_avx512(q->qr, code, tq->pdim, tq->levels);
+#endif
+    else
+        dot = tq_dot_scalar(tq, q->qr, code);
+
+    if (tq->qjl) {
+        const uint8_t *qb = tq->qjl_bits + (size_t)v * tq->qjl_bytes;
+        float sd_dot;
+#ifdef TQ_HAVE_SIMD
+        if (q->simd) sd_dot = tq_signdot_avx512(q->Sq, qb, tq->pdim);
+        else
+#endif
+            sd_dot = tq_signdot_scalar(q->Sq, qb, tq->pdim);
+        float ip_unit = dot * q->inv_sd + tq->rnorms[v] * q->qjl_const * sd_dot;
+        float n = tq->norms[v];
+        return q->qn - 2.f * n * ip_unit + n * n;
+    }
+    float s = tq->norms[v] * q->inv_sd;
+    return q->qn - 2.f * s * dot + s * s * tq->csqs[v];
+}
+
+/* Encode one vector to its code in tq's storage by inserting it; returns
+ * the internal index. (Thin wrapper so the hybrid speaks intent.)      */
+int64_t tq_encode(TQIndex *tq, uint64_t id, const float *vec)
+{
+    return tq_add(tq, id, vec);
+}
+
+int tq_search(const TQIndex *tq_c, const float *query, int k, VecResult *out)
+{
+    TQIndex *tq = (TQIndex *)tq_c;
+    if (!tq || tq->count == 0 || k <= 0) return 0;
+    if ((size_t)k > tq->count) k = (int)tq->count;
+
+    TQQuery *q = tq_query_begin(tq, query);
+
     float    *hd = malloc((size_t)k * sizeof(float));
     uint32_t *hi = malloc((size_t)k * sizeof(uint32_t));
     int hn = 0;
-    float inv_sd = 1.0f / sqrtf((float)tq->pdim);
 
     for (size_t v = 0; v < tq->count; v++) {
-        const uint8_t *code = tq->codes + v * tq->code_bytes;
-        float dot;
-        if (use_i8) {
-#if defined(TQ_NEON_DOT)
-            int32_t di = (tq->bits == 4)
-                ? tq_dot4_neon(qi8, code, tq->pdim, tq->l8)
-                : tq_dot8_neon(qi8, (const int8_t *)code, tq->pdim);
-            dot = (float)di * i8_inv_scale;     /* signed x signed: no bias */
-#else
-            int32_t di;
-#ifdef TQ_HAVE_VNNI
-            if ((tq->pdim % 64) == 0)
-                di = tq_doti8_vnni(qu8, (const int8_t *)code, tq->pdim);
-            else
-#endif
-                di = tq_doti8_scalar(qu8, (const int8_t *)code, tq->pdim);
-            dot = (float)(di - 128 * tq->i8sums[v]) * i8_inv_scale;
-#endif
-        }
-#ifdef TQ_HAVE_SIMD
-        else if (simd && tq->bits == 4)
-            dot = tq_dot4_avx512(qr, code, tq->pdim, tq->levels);
-#endif
-        else
-            dot = tq_dot_scalar(tq, qr, code);
-
-        float s = tq->norms[v] * inv_sd;
-        float d;
-        if (tq->qjl) {
-            /* unbiased <q,x> = n*(<qr,y_hat> + ||r||*qjl_est), then
-             * ||q-x||^2 = ||q||^2 - 2<q,x> + ||x||^2 with the TRUE norm */
-            const uint8_t *qb = tq->qjl_bits + v * tq->qjl_bytes;
-            float sd_dot;
-#ifdef TQ_HAVE_SIMD
-            if (simd) sd_dot = tq_signdot_avx512(Sq, qb, tq->pdim);
-            else
-#endif
-                sd_dot = tq_signdot_scalar(Sq, qb, tq->pdim);
-            float ip_unit = dot * inv_sd + tq->rnorms[v] * qjl_const * sd_dot;
-            float n = tq->norms[v];
-            d = qn - 2.f * n * ip_unit + n * n;
-        } else {
-            d = qn - 2.f * s * dot + s * s * tq->csqs[v];
-        }
+        float d = tq_score_code(q, (uint32_t)v);
 
         if (hn < k) {                       /* push */
             int j = hn++;
@@ -622,7 +650,8 @@ int tq_search(const TQIndex *tq_c, const float *query, int k, VecResult *out)
             j = m;
         }
     }
-    free(qr); free(Sq); free(qu8); free(qi8); free(hd); free(hi);
+    tq_query_free(q);
+    free(hd); free(hi);
     return hn;
 }
 
