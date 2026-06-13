@@ -497,23 +497,36 @@ glance rather than read off a table.
 parameters (M=16, efConstruction=200), recall against the provided ground
 truth:
 
-| ef  | recall@10 | vecdb QPS | faiss QPS | vecdb vs faiss |
-|-----|-----------|-----------|-----------|----------------|
-| 10  | 0.740     | 27,536    | 23,164    | 1.19x          |
-| 50  | 0.954     |  9,325    |  6,758    | 1.38x          |
-| 100 | 0.985     |  5,307    |  3,668    | 1.45x          |
-| 200 | 0.996     |  2,942    |  1,947    | 1.51x          |
-| 400 | 0.999     |  1,622    |  1,003    | 1.62x          |
+Matched HNSW params (M=16, efC=200), recall vs the provided ground truth.
+Recall is identical to FAISS to ~3 decimals at every ef — same answers,
+measured at both 1 and 8 search threads:
 
-Recall is identical to three decimals at every ef — same answers, returned
-faster. At every useful operating point (recall ≥ 0.95) vecdb is 1.4–1.6x
-faster than FAISS HNSW on this machine, and the parallel build was 2.1x
-faster (233s vs 487s, FAISS HNSW building single-threaded by default).
+| ef  | recall | vecdb 1t | faiss 1t | 1t  | vecdb 8t | faiss 8t | 8t   |
+|-----|--------|----------|----------|-----|----------|----------|------|
+| 10  | 0.740  | 27,400   | 22,598   |1.21x| 92,647   |107,640   |0.86x |
+| 50  | 0.954  |  9,297   |  6,690   |1.39x| 35,507   | 32,074   |1.11x |
+| 100 | 0.985  |  5,343   |  3,636   |1.47x| 20,389   | 17,414   |1.17x |
+| 200 | 0.996  |  2,983   |  1,943   |1.54x| 11,896   |  8,916   |1.33x |
+| 400 | 0.999  |  1,626   |  1,006   |1.62x|  6,658   |  4,441   |1.50x |
+| 800 | 0.999  |    897   |    492   |1.82x|  3,677   |  2,077   |1.77x |
 
-Scope of the claim: single-thread search, Apple Silicon (NEON kernels),
-SIFT1M. FAISS can also multi-thread search; on x86 with AVX-512 the gap may
-differ. The point is parity-or-better against the reference implementation on
-the standard dataset, not a universal speed record.
+Reading it honestly:
+- **Single thread:** vecdb is faster at every point (1.2–1.8x).
+- **8 threads:** FAISS scales better at low ef (it wins ef=10, where each
+  query is tiny and thread-dispatch overhead dominates — FAISS's threading
+  has less per-query overhead than vecdb's `schedule(dynamic)` dispatch).
+  But across the entire useful range (recall ≥ 0.95) vecdb still wins, and
+  the lead *widens* with ef: as each query does more distance work, the
+  faster per-query kernel (NEON, prefetch, flat link arenas) dominates and
+  dispatch overhead becomes negligible. FAISS wins the dispatch race; vecdb
+  wins the compute race.
+- vecdb's parallel **build** was 2.1x faster (233s vs 493s).
+
+Scope: Apple Silicon (NEON kernels), SIFT1M. On x86 with AVX-512 the per-query
+kernel gap likely narrows. vecdb scales ~3.4x at 8 threads vs FAISS's ~4.8x —
+FAISS threads more efficiently; vecdb's per-query work is faster. The honest
+summary is: faster single-thread across the board, and faster at all useful
+operating points multi-threaded, but out-scaled at the cheap/low-recall end.
 
 The `.fvecs`/`.ivecs` loaders are validated by a format round-trip; the full
 pipeline (load → build → recall-vs-ground-truth) is exercised on a small
