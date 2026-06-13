@@ -353,7 +353,8 @@ Makefile       # build rules for libvecdb.so and bench
 pyproject.toml # Python package metadata
 tests.py       # correctness, churn, filtering, concurrency suite (python tests.py)
 .github/       # CI: build + full test suite on every push
-benchmarks/    # FAISS/Chroma/Qdrant comparison + quantization shoot-out
+benchmarks/    # FAISS/Chroma/Qdrant comparison, quantization shoot-out,
+               #   parallel scaling, and SIFT1M (standard ANN dataset)
 ```
 
 ## Measured results
@@ -461,6 +462,25 @@ Caveats: x86 numbers from one AVX-512 + VNNI machine, ARM numbers from one
 M2 Pro; synthetic clustered data, single thread; the Qdrant comparison in
 `benchmarks/benchmark.py` uses qdrant-client's in-process mode, not a
 server.
+
+## SIFT1M (standard benchmark dataset)
+
+`benchmarks/bench_sift.py` runs against SIFT1M (Inria TEXMEX): 1M base + 10k
+query vectors at dim 128, with a provided ground-truth file of the true 100
+nearest neighbors per query. Recall is measured against that canonical answer
+key — not our own exact search — so results are directly comparable to
+published FAISS / hnswlib / Qdrant numbers.
+
+```sh
+wget ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
+tar xzf sift.tar.gz
+PYTHONPATH=. python3 benchmarks/bench_sift.py --dir sift --faiss --build-threads 8
+```
+
+The `.fvecs`/`.ivecs` loaders are validated by a format round-trip; the full
+pipeline (load → build → recall-vs-ground-truth) is exercised in CI on a
+small synthetic file in the same binary layout. Real SIFT1M numbers depend on
+the machine and are left for the user to generate.
 
 ## License
 
