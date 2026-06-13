@@ -354,7 +354,8 @@ pyproject.toml # Python package metadata
 tests.py       # correctness, churn, filtering, concurrency suite (python tests.py)
 .github/       # CI: build + full test suite on every push
 benchmarks/    # FAISS/Chroma/Qdrant comparison, quantization shoot-out,
-               #   parallel scaling, and SIFT1M (standard ANN dataset)
+               #   parallel scaling, SIFT1M (standard ANN dataset),
+               #   and a recall-QPS Pareto plot vs FAISS
 ```
 
 ## Measured results
@@ -476,6 +477,19 @@ wget ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
 tar xzf sift.tar.gz
 PYTHONPATH=. python3 benchmarks/bench_sift.py --dir sift --faiss --build-threads 8
 ```
+
+For the standard recall-vs-QPS Pareto figure (and a multi-threaded
+head-to-head — both sides at matched thread counts, since FAISS multi-threads
+search too):
+
+```sh
+PYTHONPATH=. python3 benchmarks/bench_sift_pareto.py --dir sift --faiss \
+    --search-threads 1 8 --plot sift_pareto.png
+```
+
+This plots recall@10 vs QPS (log scale) for vecdb and FAISS on the same axes
+— the convention ann-benchmarks uses — so the comparison is legible at a
+glance rather than read off a table.
 
 ### Measured result: vecdb vs FAISS on SIFT1M (M2 Pro)
 
