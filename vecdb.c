@@ -8,6 +8,9 @@
  *     levels 1..L contiguous with stride (M+2) u32.
  */
 #include "vecdb.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -490,6 +493,43 @@ static void shrink_links(VecDB *db, uint32_t node, int level)
     free(sel); free(cands);
 }
 
+/* Wire an already-stored node (vector, norm, level, upper block all set)
+ * into the HNSW graph. Serial: mutates shared graph state and the entry
+ * point. Factored out so bulk insert can parallelize the per-vector
+ * storage work (Phase 1) and call this in a serial pass (Phase 2). */
+static void wire_node(VecDB *db, uint32_t idx, const float *vec)
+{
+    int level = db->node_level[idx];
+    uint32_t ep = (uint32_t)db->entry;
+    for (int l = db->max_level; l > level; l--)
+        ep = greedy_step(db, vec, ep, l);
+    int start = level < db->max_level ? level : db->max_level;
+    for (int l = start; l >= 0; l--) {
+        Heap res; heap_init(&res, db->ef_construction + 1, 1);
+        search_layer(db, vec, ep, db->ef_construction, l, &res, 0, NULL);
+        int M = db->M;
+        uint32_t *sel = malloc((size_t)M * sizeof(uint32_t));
+        int kept = select_neighbors(db, vec, res.a, res.n, M, sel);
+        uint32_t *L = node_links(db, idx, l);
+        for (int j = 0; j < kept; j++) L[1 + L[0]++] = sel[j];
+        for (int j = 0; j < kept; j++) {
+            uint32_t *NL = node_links(db, sel[j], l);
+            NL[1 + NL[0]++] = idx;
+            if ((int)NL[0] > link_cap(db, l)) shrink_links(db, sel[j], l);
+        }
+        float bd = 1e30f; uint32_t bn = ep;
+        for (int j = 0; j < res.n; j++)
+            if (res.a[j].dist < bd) { bd = res.a[j].dist; bn = res.a[j].node; }
+        ep = bn;
+        free(sel);
+        heap_destroy(&res);
+    }
+    if (level > db->max_level) {
+        db->max_level = level;
+        db->entry = idx;
+    }
+}
+
 int64_t vecdb_add(VecDB *db, uint64_t id, const float *vec)
 {
     if (!db) return -1;
@@ -523,39 +563,7 @@ int64_t vecdb_add(VecDB *db, uint64_t id, const float *vec)
         db->max_level = level;
         return idx;
     }
-    uint32_t ep = (uint32_t)db->entry;
-    /* descend from the top to level+1 greedily */
-    for (int l = db->max_level; l > level; l--)
-        ep = greedy_step(db, vec, ep, l);
-    /* insert on each layer from min(level, max_level) down to 0 */
-    int start = level < db->max_level ? level : db->max_level;
-    for (int l = start; l >= 0; l--) {
-        Heap res; heap_init(&res, db->ef_construction + 1, 1);
-        search_layer(db, vec, ep, db->ef_construction, l, &res, 0, NULL);
-        int M = db->M;  /* links to create from the new node */
-        uint32_t *sel = malloc((size_t)M * sizeof(uint32_t));
-        int kept = select_neighbors(db, vec, res.a, res.n, M, sel);
-        /* connect new -> selected */
-        uint32_t *L = node_links(db, idx, l);
-        for (int j = 0; j < kept; j++) L[1 + L[0]++] = sel[j];
-        /* connect selected -> new, pruning overfull lists */
-        for (int j = 0; j < kept; j++) {
-            uint32_t *NL = node_links(db, sel[j], l);
-            NL[1 + NL[0]++] = idx;
-            if ((int)NL[0] > link_cap(db, l)) shrink_links(db, sel[j], l);
-        }
-        /* best candidate becomes entry for the next (lower) layer */
-        float bd = 1e30f; uint32_t bn = ep;
-        for (int j = 0; j < res.n; j++)
-            if (res.a[j].dist < bd) { bd = res.a[j].dist; bn = res.a[j].node; }
-        ep = bn;
-        free(sel);
-        heap_destroy(&res);
-    }
-    if (level > db->max_level) {
-        db->max_level = level;
-        db->entry = idx;
-    }
+    wire_node(db, idx, vec);
     return idx;
 }
 
@@ -567,13 +575,97 @@ int64_t vecdb_add(VecDB *db, uint64_t id, const float *vec)
  * loop). Delegates to vecdb_add per element so there is exactly one
  * insert code path. Returns 0 on success; on the first failure
  * (duplicate id or OOM) returns -1 with prior elements inserted. */
-int vecdb_add_bulk(VecDB *db, const uint64_t *ids, const float *vecs, size_t n)
+/* Bulk insert with a parallel storage phase.
+ *
+ * Phase 1 (parallel-eligible): for each new vector, copy it, compute its
+ * squared norm, sample its level, and allocate its upper-link block. These
+ * are independent across vectors EXCEPT level sampling, which advances the
+ * shared RNG and must stay serial for determinism — so Phase 1 splits into
+ * a serial metadata pass (ids, levels, slots, RNG) and a parallel compute
+ * pass (the norm dot-products, which dominate Phase 1's cost).
+ *
+ * Phase 2 (serial): wire each node into the HNSW graph in id order. Graph
+ * construction is inherently sequential — each insert reads and mutates the
+ * evolving graph — so this matches single-threaded build quality exactly;
+ * the bulk path produces a byte-identical graph to repeated vecdb_add.
+ *
+ * threads<=0 uses the OpenMP default; without OpenMP it runs serial. */
+static int bulk_insert(VecDB *db, const uint64_t *ids, const float *vecs,
+                       size_t n, int threads)
 {
     if (!db || (!ids && n) || (!vecs && n)) return -1;
-    for (size_t i = 0; i < n; i++)
-        if (vecdb_add(db, ids[i], vecs + i * (size_t)db->dim) < 0)
-            return -1;
+    if (n == 0) return 0;
+
+    /* reserve capacity once so Phase-1 slot pointers stay valid */
+    while (db->count + n > db->cap)
+        if (grow(db) != 0) return -1;
+
+    /* reject duplicates (vs existing and within the batch) up front */
+    for (size_t i = 0; i < n; i++) {
+        if (map_get(db, ids[i]) != UINT32_MAX) return -1;
+        for (size_t j = i + 1; j < n; j++)
+            if (ids[j] == ids[i]) return -1;
+    }
+
+    size_t base = db->count;
+
+    /* Phase 1a (serial): slots, ids, map, levels, upper blocks. */
+    for (size_t i = 0; i < n; i++) {
+        uint32_t idx = (uint32_t)(base + i);
+        db->dead[idx] = 0;
+        db->ids[idx] = ids[i];
+        map_put(db, ids[i], idx);
+        memcpy(db->vecs + (size_t)idx * db->dim, vecs + i * (size_t)db->dim,
+               (size_t)db->dim * sizeof(float));
+        int level = sample_level(db);
+        db->node_level[idx] = (uint8_t)level;
+        node_links(db, idx, 0)[0] = 0;
+        db->upper[idx] = level > 0
+            ? calloc((size_t)level * (size_t)(db->M + 2), sizeof(uint32_t)) : NULL;
+    }
+
+    /* Phase 1b (parallel): squared norms — independent per vector, and the
+     * heaviest arithmetic in the storage phase. */
+#ifdef _OPENMP
+    if (threads > 0) omp_set_num_threads(threads);
+    #pragma omp parallel for schedule(static) if(threads != 1)
+#else
+    (void)threads;
+#endif
+    for (size_t i = 0; i < n; i++) {
+        const float *v = vecs + i * (size_t)db->dim;
+        double nsq = 0.0;
+        for (int d = 0; d < db->dim; d++) nsq += (double)v[d] * v[d];
+        db->vnorms[base + i] = (float)nsq;
+    }
+
+    db->count += n;
+    db->alive += n;
+
+    /* first-ever element: seed the entry point */
+    size_t start_i = 0;
+    if (db->entry < 0) {
+        db->entry = (int64_t)base;
+        db->max_level = db->node_level[base];
+        start_i = 1;
+    }
+
+    /* Phase 2 (serial): graph wiring, identical to single-threaded build. */
+    for (size_t i = start_i; i < n; i++)
+        wire_node(db, (uint32_t)(base + i), vecs + i * (size_t)db->dim);
+
     return 0;
+}
+
+int vecdb_add_bulk(VecDB *db, const uint64_t *ids, const float *vecs, size_t n)
+{
+    return bulk_insert(db, ids, vecs, n, 1);
+}
+
+int vecdb_add_bulk_mt(VecDB *db, const uint64_t *ids, const float *vecs,
+                      size_t n, int threads)
+{
+    return bulk_insert(db, ids, vecs, n, threads);
 }
 
 /* ------------------------------------------------------------------ */

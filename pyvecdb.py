@@ -71,6 +71,8 @@ _lib.vecdb_load.restype = c_void_p
 
 _lib.vecdb_add_bulk.argtypes = [c_void_p, POINTER(c_uint64), POINTER(c_float), c_size_t]
 _lib.vecdb_add_bulk.restype = c_int
+_lib.vecdb_add_bulk_mt.argtypes = [c_void_p, POINTER(c_uint64), POINTER(c_float), c_size_t, c_int]
+_lib.vecdb_add_bulk_mt.restype = c_int
 
 # Delete support
 _lib.vecdb_delete.argtypes = [c_void_p, c_uint64]
@@ -129,8 +131,10 @@ class VecDB:
         # fallback to bulk C call – much faster for large n
         self.add_bulk(ids, vectors)
 
-    def add_bulk(self, ids: np.ndarray, vectors: np.ndarray) -> None:
-        """High‑performance bulk insert.
+    def add_bulk(self, ids: np.ndarray, vectors: np.ndarray, threads: int = 1) -> None:
+        """High-performance bulk insert. threads>1 parallelizes the storage
+        phase (norm computation); the HNSW graph is built serially, so the
+        index is identical regardless of thread count.
 
         *ids*: 1‑D ``np.uint64`` array of length *N*.
         *vectors*: 2‑D ``np.float32`` array of shape *(N, dim)*.
@@ -142,10 +146,17 @@ class VecDB:
         if vectors.ndim != 2 or vectors.shape[0] != ids.shape[0] or vectors.shape[1] != self.dim:
             raise ValueError(f"vectors must be shape (N, {self.dim}) and dtype float32")
         vectors = np.ascontiguousarray(vectors, dtype=np.float32)
-        rc = _lib.vecdb_add_bulk(self._h,
-                                 ids.ctypes.data_as(POINTER(c_uint64)),
-                                 vectors.ctypes.data_as(POINTER(c_float)),
-                                 ctypes.c_size_t(ids.shape[0]))
+        if threads and threads != 1:
+            rc = _lib.vecdb_add_bulk_mt(self._h,
+                                        ids.ctypes.data_as(POINTER(c_uint64)),
+                                        vectors.ctypes.data_as(POINTER(c_float)),
+                                        ctypes.c_size_t(ids.shape[0]),
+                                        ctypes.c_int(threads))
+        else:
+            rc = _lib.vecdb_add_bulk(self._h,
+                                     ids.ctypes.data_as(POINTER(c_uint64)),
+                                     vectors.ctypes.data_as(POINTER(c_float)),
+                                     ctypes.c_size_t(ids.shape[0]))
         if rc != 0:
             raise RuntimeError("vecdb_add_bulk failed (duplicate ID or OOM)")
 

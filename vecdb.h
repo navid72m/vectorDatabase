@@ -44,6 +44,13 @@ int vecdb_add_bulk(VecDB *db,
                     const float *vecs,
                     size_t n);
 
+/* Bulk insert with a parallel storage phase (OpenMP). Graph construction
+ * stays serial, so the resulting index is identical to vecdb_add_bulk;
+ * the parallel win is the per-vector norm computation. threads<=0 uses the
+ * OpenMP default. Without OpenMP this is identical to vecdb_add_bulk. */
+int vecdb_add_bulk_mt(VecDB *db, const uint64_t *ids, const float *vecs,
+                      size_t n, int threads);
+
 /* Delete a vector by its user-supplied id (O(1), tombstone). The node keeps
  * carrying graph connectivity but is excluded from all results.
  * Returns 0 on success, -1 if id not found. */
