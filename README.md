@@ -543,6 +543,14 @@ synthetic file in the same binary layout.
 
 ### Second dataset: GIST1M (960-d) — a different regime
 
+![GIST1M recall vs QPS, vecdb vs FAISS](docs/gist_pareto.png)
+
+Recall@10 vs QPS (log) on GIST1M, 1 and 8 threads. Read at matched recall:
+the curves cross — FAISS is higher-right at low recall, vecdb at high recall
+(and reaches recall FAISS doesn't in this sweep). Regenerate with
+`benchmarks/bench_sift_pareto.py --dir gist`.
+
+
 GIST1M (1M x 960, same TEXMEX format) is a harder, higher-dimensional test.
 At 960-d, recall must be read against recall, not ef: vecdb returns higher
 recall than FAISS at every ef (better graph quality where navigation is
