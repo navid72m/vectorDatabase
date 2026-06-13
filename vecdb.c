@@ -1093,6 +1093,18 @@ int vecdb_search_hnsw_batch(const VecDB *db, const float *queries, int nq,
 
 size_t vecdb_slots(const VecDB *db) { return db ? db->count : 0; }
 
+/* Set the OpenMP thread count for subsequent parallel searches. <=0 resets
+ * to the OpenMP default. No-op without OpenMP. */
+void vecdb_set_threads(int n)
+{
+#ifdef _OPENMP
+    if (n > 0) omp_set_num_threads(n);
+    else omp_set_num_threads(omp_get_num_procs());
+#else
+    (void)n;
+#endif
+}
+
 /* Build a slot mask (count bytes) from user ids.
  * mode 0: allow-list (mask starts 0, listed ids set to 1)
  * mode 1: deny-list  (mask starts 1, listed ids set to 0)

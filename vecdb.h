@@ -89,6 +89,9 @@ int vecdb_search_hnsw_batch(const VecDB *db, const float *queries, int nq,
                             int k, int ef, const uint8_t *mask, VecResult *out);
 
 size_t  vecdb_slots(const VecDB *db);
+
+/* Set OpenMP thread count for parallel batch searches (<=0 = default). */
+void    vecdb_set_threads(int n);
 int64_t vecdb_make_mask(const VecDB *db, const uint64_t *ids, size_t n,
                         int mode, uint8_t *mask);
 int vecdb_search_hnsw_filtered(const VecDB *db, const float *query, int k, int ef,

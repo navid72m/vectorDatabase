@@ -62,6 +62,8 @@ _lib.vecdb_search_hnsw_batch.argtypes = [c_void_p, POINTER(c_float), c_int, c_in
 _lib.vecdb_search_hnsw_batch.restype = c_int
 _lib.vecdb_slots.argtypes = [c_void_p]
 _lib.vecdb_slots.restype = c_size_t
+_lib.vecdb_set_threads.argtypes = [c_int]
+_lib.vecdb_set_threads.restype = None
 _lib.vecdb_make_mask.argtypes = [c_void_p, POINTER(c_uint64), c_size_t, c_int, ctypes.c_char_p]
 _lib.vecdb_make_mask.restype = c_int64
 _lib.vecdb_save.argtypes = [c_void_p, c_char_p]
@@ -79,6 +81,12 @@ _lib.vecdb_delete.argtypes = [c_void_p, c_uint64]
 _lib.vecdb_delete.restype = c_int
 _lib.vecdb_compact.argtypes = [c_void_p]
 _lib.vecdb_compact.restype = c_int
+
+
+def set_threads(n: int) -> None:
+    """Set OpenMP thread count for parallel batch searches (<=0 = default).
+    Requires an OpenMP build (make OMP=1); no-op otherwise."""
+    _lib.vecdb_set_threads(int(n))
 
 
 def _as_f32_matrix(x: np.ndarray, dim: int) -> np.ndarray:
