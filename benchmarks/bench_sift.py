@@ -10,6 +10,10 @@ Download (≈170 MB tar, expands to ≈500 MB):
     wget ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
     tar xzf sift.tar.gz          # -> sift/{sift_base,sift_query,sift_groundtruth}.{fvecs,ivecs}
 
+Also works on GIST1M (960-d, same format, ~3.6 GB) and any TEXMEX dataset:
+    wget ftp://ftp.irisa.fr/local/texmex/corpus/gist.tar.gz && tar xzf gist.tar.gz
+    python3 benchmarks/bench_sift.py --dir gist          # prefix auto-detected
+
 Run:
     PYTHONPATH=. python3 benchmarks/bench_sift.py --dir sift
     PYTHONPATH=. python3 benchmarks/bench_sift.py --dir sift --faiss --threads 8
@@ -39,7 +43,9 @@ def read_ivecs(path):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--dir", default="sift", help="dir with sift_*.{fvecs,ivecs}")
+    p.add_argument("--dir", default="sift", help="dir with <prefix>_*.{fvecs,ivecs}")
+    p.add_argument("--prefix", default=None,
+                   help="filename prefix (default: basename of --dir, e.g. sift/gist)")
     p.add_argument("--k", type=int, default=10)
     p.add_argument("--efs", type=int, nargs="+", default=[10, 50, 100, 200, 400])
     p.add_argument("--M", type=int, default=16)
@@ -50,12 +56,13 @@ def main():
     p.add_argument("--faiss", action="store_true")
     args = p.parse_args()
 
-    base = read_fvecs(os.path.join(args.dir, "sift_base.fvecs"))
-    query = read_fvecs(os.path.join(args.dir, "sift_query.fvecs"))
-    gt = read_ivecs(os.path.join(args.dir, "sift_groundtruth.ivecs"))
+    pfx = args.prefix or os.path.basename(os.path.normpath(args.dir))
+    base = read_fvecs(os.path.join(args.dir, f"{pfx}_base.fvecs"))
+    query = read_fvecs(os.path.join(args.dir, f"{pfx}_query.fvecs"))
+    gt = read_ivecs(os.path.join(args.dir, f"{pfx}_groundtruth.ivecs"))
     n, dim = base.shape
     nq = query.shape[0]
-    print(f"SIFT1M: base={n:,}x{dim}  queries={nq:,}  k={args.k}  "
+    print(f"{pfx.upper()}: base={n:,}x{dim}  queries={len(query):,}  k={args.k}  "
           f"M={args.M} efC={args.ef_construction}")
     gt_sets = [set(row[:args.k].tolist()) for row in gt]
 

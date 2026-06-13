@@ -35,6 +35,8 @@ def measure(search_fn, queries, gt_sets, k, reps=3):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dir", default="sift")
+    p.add_argument("--prefix", default=None,
+                   help="filename prefix (default: basename of --dir, e.g. sift/gist)")
     p.add_argument("--k", type=int, default=10)
     p.add_argument("--efs", type=int, nargs="+", default=[10, 20, 50, 100, 200, 400, 800])
     p.add_argument("--M", type=int, default=16)
@@ -45,12 +47,13 @@ def main():
     p.add_argument("--plot", default="sift_pareto.png")
     args = p.parse_args()
 
-    base = read_fvecs(os.path.join(args.dir, "sift_base.fvecs"))
-    query = read_fvecs(os.path.join(args.dir, "sift_query.fvecs"))
-    gt = read_ivecs(os.path.join(args.dir, "sift_groundtruth.ivecs"))
+    pfx = args.prefix or os.path.basename(os.path.normpath(args.dir))
+    base = read_fvecs(os.path.join(args.dir, f"{pfx}_base.fvecs"))
+    query = read_fvecs(os.path.join(args.dir, f"{pfx}_query.fvecs"))
+    gt = read_ivecs(os.path.join(args.dir, f"{pfx}_groundtruth.ivecs"))
     n, dim = base.shape
     gt_sets = [set(row[:args.k].tolist()) for row in gt]
-    print(f"SIFT1M: {n:,}x{dim}, {len(query):,} queries, k={args.k}")
+    print(f"{pfx.upper()}: {n:,}x{dim}, {len(query):,} queries, k={args.k}")
 
     ids = np.arange(n, dtype=np.uint64)
     db = VecDB(dim=dim, M=args.M, ef_construction=args.ef_construction, capacity=n)
