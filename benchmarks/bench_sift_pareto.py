@@ -102,12 +102,16 @@ def main():
             order = np.argsort(recs)
             ax.plot(np.array(recs)[order], np.array(qpss)[order],
                     label=label, **styles[key])
+        ax.axvspan(0.95, 1.0, color="green", alpha=0.06)
         ax.set_yscale("log")
-        ax.set_xlabel(f"recall@{args.k}")
+        ax.set_xlabel(f"recall@{args.k}  (higher-right is better)")
         ax.set_ylabel("QPS (log scale)")
         ax.set_title(f"SIFT1M: recall vs throughput (M={args.M}, efC={args.ef_construction})")
+        ax.annotate("typical operating range (recall ≥ 0.95)",
+                    xy=(0.975, 0.02), xycoords=("data", "axes fraction"),
+                    ha="center", fontsize=8, color="green")
         ax.grid(True, which="both", alpha=0.3)
-        ax.legend()
+        ax.legend(title="solid=vecdb  dashed=faiss")
         fig.tight_layout()
         fig.savefig(args.plot, dpi=130)
         print(f"\nplot written to {args.plot}")

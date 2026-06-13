@@ -493,6 +493,15 @@ glance rather than read off a table.
 
 ### Measured result: vecdb vs FAISS on SIFT1M (M2 Pro)
 
+![SIFT1M recall vs QPS, vecdb vs FAISS](docs/sift_pareto.png)
+
+Recall@10 (x) vs throughput (y, log) on SIFT1M, both at 1 and 8 search
+threads. Higher-and-to-the-right is better. vecdb (solid) leads FAISS
+(dashed) single-threaded across the whole curve, and multi-threaded across
+the operating range (recall ≥ 0.95); FAISS scales better only at the
+cheap/low-recall left edge. Regenerate with `benchmarks/bench_sift_pareto.py`.
+
+
 1M base + 10k queries, dim 128, single-thread search, matched HNSW
 parameters (M=16, efConstruction=200), recall against the provided ground
 truth:
