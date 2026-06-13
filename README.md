@@ -14,7 +14,7 @@
 - **Filtered search** — restrict any search to an allow-list or away from a deny-list of IDs; HNSW traverses through filtered nodes so selective filters cannot disconnect the search.
 - **Concurrent reads** — searches are thread-safe (per-thread visited buffers, no shared mutable state); any number of threads may search one index simultaneously. Writes require external exclusion.
 - **OpenMP batch search** — `make OMP=1` parallelizes batched HNSW, exact, and TurboQuant searches over queries. Single-threaded behavior is unchanged; results are identical either way.
-- **Parallel insert (experimental)** — `add_bulk(ids, vecs, threads=N)` builds the HNSW graph concurrently using a published-node model: a node becomes a traversal target (atomic release/acquire flag) only after its links are fully wired, and per-node locks guard every link-list read and mutation. Produces a graph of equivalent recall to the serial build (verified to within +-0.02 at up to 16 threads, ASan-clean). The serial path is the default and is byte-identical to repeated single inserts.
+- **Parallel insert (experimental)** — `add_bulk(ids, vecs, threads=N)` builds the HNSW graph concurrently using a published-node model: a node becomes a traversal target (atomic release/acquire flag) only after its links are fully wired, and per-node locks guard every link-list read and mutation. Produces a graph of equivalent recall to the serial build (verified to within +-0.02, ASan-clean). Measured 1.73x at 8 threads on an M2 Pro for a 1M-vector build (see scaling table below); the serial path is the default and is byte-identical to repeated single inserts.
 - **NEON kernels** — on AArch64 (Apple Silicon, Graviton, ...) the distance kernel, blocked exact scan, and both TurboQuant scans use NEON; the 4-bit codebook decodes via a single `tbl` table register and both quantized scans run on `sdot` (signed x signed, so no zero-point correction). Verified against scalar references under QEMU in CI.
 - **Hybrid index (HNSW + TurboQuant + rerank)** — an HNSW graph that traverses on TurboQuant code distances and reranks the top candidates with exact fp32; matches pure-fp32 recall while the resident footprint (codes + graph) is smaller than the fp32 vectors alone.
 - **TurboQuant compressed index** — optional 4-bit or 8-bit compressed brute-force index with randomized Hadamard rotation, norm separation, Lloyd-Max Gaussian quantization, and optional QJL residual estimation.
@@ -385,7 +385,30 @@ against exact ground truth (`benchmarks/bench_large.py --n 1000000`):
 | 200 |  5,427 | 0.989     |
 | 400 |  3,836 | 0.999     |
 
-Build: 178s (5,622 vec/s) with capacity preallocated.
+Build: 178s (5,622 vec/s) with capacity preallocated. (Build times are not
+comparable across machines — different CPUs, clocks, and memory; in the
+parallel table below, compare thread counts within the single M2 Pro run.)
+
+### Parallel insert scaling (M2 Pro, 6 performance + 4 efficiency cores)
+
+1M x 128 clustered vectors, `add_bulk(ids, vecs, threads=N)`, concurrent
+HNSW graph construction (gcc-15, `make OMP=1`):
+
+| threads | build | vec/s | speedup |
+|---------|-------|-------|---------|
+| 1       | 322.8s | 3,098 | 1.00x  |
+| 2       | 247.3s | 4,044 | 1.31x  |
+| 4       | 203.4s | 4,916 | 1.59x  |
+| 6       | 193.4s | 5,170 | 1.67x  |
+| 8       | 186.9s | 5,351 | 1.73x  |
+
+The curve flattens after 4 threads — the expected signature of HNSW insert:
+a small set of well-connected "hub" nodes are selected as neighbors by most
+inserts, so threads serialize on those nodes' locks (plus a global
+entry/max_level lock taken twice per insert). hnswlib shows the same
+sublinear scaling for the same reason. The graph built concurrently has
+recall equivalent to the serial build (verified to within +-0.02). Reducing
+the plateau (striped locks, a read-mostly max_level check) is future work.
 
 ### Hybrid index: recall of fp32, memory of codes
 
