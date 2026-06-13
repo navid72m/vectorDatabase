@@ -410,6 +410,29 @@ sublinear scaling for the same reason. The graph built concurrently has
 recall equivalent to the serial build (verified to within +-0.02). Reducing
 the plateau (striped locks, a read-mostly max_level check) is future work.
 
+### Parallel search scaling (M2 Pro, same machine)
+
+Search is read-only over a frozen graph (thread-safe via per-thread visited
+buffers), so unlike insert it holds no locks and contends on nothing but the
+memory system. 500k x 128 vectors, 10k queries, `set_threads(N)`
+(`benchmarks/bench_search_mt.py`):
+
+| threads | HNSW (ef=100) | exact scan | TurboQuant 8-bit |
+|---------|---------------|------------|------------------|
+| 1       | 1.00x         | 1.00x      | 1.00x            |
+| 2       | 1.82x         | 1.94x      | 1.77x            |
+| 4       | 3.06x         | 3.55x      | 3.28x            |
+| 6       | 3.58x         | 4.36x      | 3.96x            |
+| 8       | 3.97x         | 5.17x      | 4.38x            |
+
+The contrast with the insert table is the point: writes contend on hub-node
+locks and plateau at ~1.7x; reads share no mutable state and scale near the
+performance-core count. Note the exact scan scales *best* (5.17x) despite
+being the simplest algorithm — its tight, uniform, fully-independent loop is
+the most parallel-friendly, while HNSW's irregular pointer-chasing through
+shared graph memory hits the memory system sooner. Even lock-free
+parallelism has a ceiling, and here it's bandwidth, not coordination.
+
 ### Hybrid index: recall of fp32, memory of codes
 
 The hybrid runs the HNSW graph on TurboQuant codes (Design A) and reranks
